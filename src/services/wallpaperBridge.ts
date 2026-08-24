@@ -1,5 +1,28 @@
 import { NativeModules } from 'react-native';
-import type { PickedVideo, WallpaperCapabilities } from '../types';
+import type { PickedVideo, WallpaperCapabilities, WallpaperApplyResult } from '../types';
+
+const NATIVE_CALL_TIMEOUT_MS = 15000;
+
+type NativeWallpaperResult = {
+  ok?: unknown;
+  id?: unknown;
+  destination?: unknown;
+  mode?: unknown;
+  error?: unknown;
+  errorCode?: unknown;
+};
+
+type NativeVideoResult = {
+  uri?: unknown;
+  durationSeconds?: unknown;
+};
+
+type NativeWallpaperModule = {
+  getCapabilities?: () => Promise<unknown>;
+  applyWallpaper?: (...args: unknown[]) => Promise<unknown>;
+  pickVideo?: () => Promise<unknown>;
+  openWallpaperPicker?: (...args: unknown[]) => Promise<unknown>;
+};
 
 const fallbackCapabilities: WallpaperCapabilities = {
   supportsLiveWallpaper: false,
@@ -8,12 +31,61 @@ const fallbackCapabilities: WallpaperCapabilities = {
   features: ['Doodle renderer', 'Video preview', 'Wallpaper picker'],
 };
 
+/**
+ * Wraps a promise with a timeout. If the native call doesn't resolve within
+ * the given duration, the promise rejects with a timeout error.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+function getNativeModule(): NativeWallpaperModule | null {
+  const mod: unknown = NativeModules.WallpaperModule;
+  if (typeof mod !== 'object' || mod === null) {
+    console.warn('WallpaperModule native module is not available');
+    return null;
+  }
+  return mod as NativeWallpaperModule;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 export const wallpaperBridge = {
   async getCapabilities(): Promise<WallpaperCapabilities> {
     try {
-      const nativeModule = NativeModules.WallpaperModule;
+      const nativeModule = getNativeModule();
       if (nativeModule && typeof nativeModule.getCapabilities === 'function') {
-        return await nativeModule.getCapabilities();
+        const result = await withTimeout(
+          nativeModule.getCapabilities(),
+          NATIVE_CALL_TIMEOUT_MS,
+          'getCapabilities',
+        );
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
+          const capabilities = result as {
+            supportsLiveWallpaper?: unknown;
+            minSdk?: unknown;
+            targetSdk?: unknown;
+            features?: unknown;
+          };
+          return {
+            supportsLiveWallpaper: capabilities.supportsLiveWallpaper === true,
+            minSdk: Number.isFinite(Number(capabilities.minSdk)) ? Number(capabilities.minSdk) : 24,
+            targetSdk: Number.isFinite(Number(capabilities.targetSdk)) ? Number(capabilities.targetSdk) : 36,
+            features: Array.isArray(capabilities.features)
+              ? capabilities.features.filter((feature): feature is string => typeof feature === 'string')
+              : [...fallbackCapabilities.features],
+          };
+        }
       }
       return fallbackCapabilities;
     } catch (error) {
@@ -22,46 +94,101 @@ export const wallpaperBridge = {
     }
   },
 
-  async applyWallpaper(id: string, kind: 'doodle' | 'video', destination: 'HOME' | 'LOCK' | 'BOTH', videoUri?: string, loop = true, playbackDuration = 30, audio = false) {
+  async applyWallpaper(
+    id: string,
+    kind: 'doodle' | 'video',
+    destination: 'HOME' | 'LOCK' | 'BOTH',
+    videoUri?: string,
+    loop = true,
+    playbackDuration = 30,
+    audio = false,
+  ): Promise<WallpaperApplyResult> {
     try {
-      const nativeModule = NativeModules.WallpaperModule;
+      const nativeModule = getNativeModule();
       if (nativeModule && typeof nativeModule.applyWallpaper === 'function') {
-        return await nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio);
+        const result = await withTimeout(
+          nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio),
+          NATIVE_CALL_TIMEOUT_MS,
+          'applyWallpaper',
+        );
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
+          const response = result as NativeWallpaperResult;
+          return {
+            ok: response.ok === true,
+            id: asString(response.id) ?? id,
+            destination: asString(response.destination) ?? destination,
+            mode: asString(response.mode),
+            error: asString(response.error),
+            errorCode: asString(response.errorCode),
+          };
+        }
+        return { ok: false, id, destination, error: 'Unexpected response from wallpaper module' };
       }
-      return { ok: false, id, destination, error: 'Native wallpaper module unavailable' };
+      return { ok: false, id, destination, error: 'Native wallpaper module is not available on this device', errorCode: 'MODULE_UNAVAILABLE' };
     } catch (error) {
       console.warn('Wallpaper apply failed', error);
-      return { ok: false, error: error instanceof Error ? error.message : 'Unable to open the wallpaper preview' };
+      const message = error instanceof Error ? error.message : 'Unable to open the wallpaper preview';
+      return { ok: false, id, destination, error: message, errorCode: 'APPLY_EXCEPTION' };
     }
   },
 
   async pickVideo(): Promise<PickedVideo | null> {
     try {
-      const nativeModule = NativeModules.WallpaperModule;
-      if (!nativeModule || typeof nativeModule.pickVideo !== 'function') return null;
-      const result = await nativeModule.pickVideo();
-      if (!result) return null;
-      if (typeof result === 'string') {
-        return {uri: result, durationSeconds: 30};
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.pickVideo !== 'function') {
+        return null;
       }
-      if (typeof result.uri !== 'string' || !result.uri) return null;
+      const result = await withTimeout(
+        nativeModule.pickVideo(),
+        60000, // video picking can take a while — 60s timeout
+        'pickVideo',
+      );
+      if (!result) {
+        return null;
+      }
+      if (typeof result === 'string') {
+        return { uri: result, durationSeconds: 30 };
+      }
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const video = result as NativeVideoResult;
+      if (typeof video.uri !== 'string' || !video.uri) {
+        return null;
+      }
       return {
-        uri: result.uri,
-        durationSeconds: Number.isFinite(Number(result.durationSeconds)) ? Number(result.durationSeconds) : 30,
+        uri: video.uri,
+        durationSeconds:
+          Number.isFinite(Number(video.durationSeconds)) && Number(video.durationSeconds) > 0
+            ? Number(video.durationSeconds)
+            : 30,
       };
     } catch (error) {
-      console.warn('Video picker unavailable', error);
-      return null;
+      console.warn('Video picker failed', error);
+      throw error; // Re-throw so caller can show specific error
     }
   },
 
-  async openWallpaperPicker(id: string, kind: 'doodle' | 'video', videoUri?: string, loop = true, playbackDuration = 30, accent?: string, audio = false): Promise<boolean> {
+  async openWallpaperPicker(
+    id: string,
+    kind: 'doodle' | 'video',
+    videoUri?: string,
+    loop = true,
+    playbackDuration = 30,
+    accent?: string,
+    audio = false,
+  ): Promise<boolean> {
     try {
-      const nativeModule = NativeModules.WallpaperModule;
+      const nativeModule = getNativeModule();
       if (!nativeModule || typeof nativeModule.openWallpaperPicker !== 'function') {
         return false;
       }
-      return Boolean(await nativeModule.openWallpaperPicker(id, kind, videoUri ?? '', loop, playbackDuration, accent ?? '', audio));
+      const result = await withTimeout(
+        nativeModule.openWallpaperPicker(id, kind, videoUri ?? '', loop, playbackDuration, accent ?? '', audio),
+        NATIVE_CALL_TIMEOUT_MS,
+        'openWallpaperPicker',
+      );
+      return Boolean(result);
     } catch (error) {
       console.warn('Wallpaper picker unavailable', error);
       return false;

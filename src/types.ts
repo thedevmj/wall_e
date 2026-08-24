@@ -26,3 +26,18 @@ export type WallpaperCapabilities = {
   targetSdk: number;
   features: string[];
 };
+
+export type WallpaperApplyResult = {
+  ok: boolean;
+  id?: string;
+  destination?: string;
+  mode?: string;
+  error?: string;
+  errorCode?: string;
+};
+
+export type WallpaperError = {
+  code: string;
+  message: string;
+  recoverable: boolean;
+};

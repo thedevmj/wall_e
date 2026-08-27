@@ -24,7 +24,7 @@ import { WallpaperCard } from './src/components/WallpaperCard';
 import { mockWallpapers } from './src/data/mockWallpapers';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
 import type { Wallpaper } from './src/types';
-import Video from 'react-native-video';
+import Video, { ViewType } from 'react-native-video';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────
 
@@ -323,35 +323,6 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
     [wallpaper, onApplied, onClose],
   );
 
-  const openPicker = React.useCallback(async () => {
-    if (!wallpaper) return;
-    if (wallpaper.kind === 'video' && !wallpaper.videoUri) {
-      setErrorMessage('Choose a video before opening the live wallpaper preview.');
-      return;
-    }
-    setIsApplying(true);
-    setErrorMessage(null);
-    try {
-      const opened = await wallpaperBridge.openWallpaperPicker(
-        wallpaper.id,
-        wallpaper.kind,
-        wallpaper.videoUri,
-        wallpaper.loop ?? true,
-        wallpaper.playbackDuration ?? 30,
-        wallpaper.accent,
-        wallpaper.audio ?? false,
-      );
-      if (!opened) {
-        setErrorMessage('This device does not provide a live wallpaper picker.');
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to open wallpaper picker.';
-      setErrorMessage(message);
-    } finally {
-      setIsApplying(false);
-    }
-  }, [wallpaper]);
-
   const chooseVideoForSelected = React.useCallback(async () => {
     if (!wallpaper) return;
     setErrorMessage(null);
@@ -394,11 +365,11 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
               source={{ uri: wallpaper.videoUri }}
               style={styles.videoPreview}
               resizeMode="cover"
+              viewType={ViewType.TEXTURE}
               repeat={wallpaper.loop !== false}
               paused={false}
               muted={!wallpaper.audio}
-              controls
-              playInBackground={false}
+              playInBackground={true}
               playWhenInactive={false}
               onError={() => setVideoError(true)}
             />
@@ -423,9 +394,9 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
                 {wallpaper.loop === false ? ' once' : ' on repeat'}
                 {wallpaper.audio ? ' with audio' : ' muted'}
               </Text>
-              {!wallpaper.videoUri && (
+              {(!wallpaper.videoUri || videoError) && (
                 <ActionButton
-                  label="Choose video from device"
+                  label={videoError ? 'Choose a compatible video' : 'Choose video from device'}
                   onPress={chooseVideoForSelected}
                   tone="secondary"
                 />
@@ -453,11 +424,6 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
               label="Close"
               tone="secondary"
               onPress={onClose}
-              style={styles.modalButton}
-            />
-            <ActionButton
-              label={isApplying ? 'Opening...' : 'Wallpaper picker'}
-              onPress={openPicker}
               style={styles.modalButton}
             />
           </View>

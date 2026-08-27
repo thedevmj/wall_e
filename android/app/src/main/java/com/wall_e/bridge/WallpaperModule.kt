@@ -16,6 +16,7 @@ import com.facebook.react.bridge.WritableArray
 import java.io.File
 import android.media.MediaMetadataRetriever
 import android.util.Log
+import java.io.IOException
 
 class WallpaperModule(private val reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
     private var videoPromise: Promise? = null
@@ -30,31 +31,43 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 if (promise == null) return
 
                 if (resultCode != Activity.RESULT_OK) {
+                    Log.w(TAG, "Video picker canceled: resultCode=$resultCode")
                     promise.resolve(null)
                     return
                 }
 
                 val uri = data?.data ?: data?.clipData?.getItemAt(0)?.uri
                 if (uri == null) {
+                    Log.e(TAG, "Video picker returned RESULT_OK without a URI")
                     promise.resolve(null)
                     return
                 }
 
                 try {
-                    // Use unique filename per pick to avoid overwriting previous wallpaper videos
-                    val videoFile = File(reactContext.filesDir, "wallpaper-video-${System.currentTimeMillis()}.mp4")
-                    reactContext.contentResolver.openInputStream(uri)?.use { input ->
-                        videoFile.outputStream().use { output -> input.copyTo(output) }
-                    } ?: throw IllegalStateException("Unable to read the selected video stream")
-
-                    if (!videoFile.exists() || videoFile.length() == 0L) {
-                        throw IllegalStateException("The selected video is empty or could not be saved")
+                    Log.i(TAG, "Video picked: uri=$uri scheme=${uri.scheme} authority=${uri.authority} flags=${data?.flags}")
+                    // Keep the provider grant when available, then copy the bytes into app storage.
+                    if (uri.scheme == "content") {
+                        try {
+                            val grantedFlags = data?.flags?.and(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            ) ?: Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            reactContext.contentResolver.takePersistableUriPermission(
+                                uri,
+                                grantedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                            Log.i(TAG, "Persistable permission taken for: $uri")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Provider did not allow persistable permission for $uri", e)
+                        }
                     }
 
-                    val durationSeconds = extractVideoDuration(videoFile)
+                    val playableUri = copyVideoToAppStorage(uri)
+                    Log.i(TAG, "Playable video URI: $playableUri")
+                    val durationSeconds = extractVideoDuration(playableUri)
+                        ?: throw IllegalArgumentException("The selected file is not a readable video")
 
                     val result: WritableMap = Arguments.createMap().apply {
-                        putString("uri", Uri.fromFile(videoFile).toString())
+                        putString("uri", playableUri.toString())
                         putDouble("durationSeconds", durationSeconds.toDouble())
                     }
                     promise.resolve(result)
@@ -77,7 +90,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     fun getCapabilities(promise: Promise) {
         try {
             val wallpaperManager = reactContext.getSystemService(WallpaperManager::class.java)
-            val supportsLive = wallpaperManager?.isWallpaperSupported == true && wallpaperManager.isSetWallpaperAllowed
+            val supportsLive = wallpaperManager?.isWallpaperSupported == true
 
             val featuresArray: WritableArray = Arguments.createArray().apply {
                 pushString("Doodle renderer")
@@ -112,35 +125,23 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     @ReactMethod
     fun applyWallpaper(id: String, kind: String, destination: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, promise: Promise) {
         try {
-            // For video wallpapers, validate the video file exists
-            if (kind == "video" && videoUri.isNotBlank()) {
-                val videoFile = try { File(Uri.parse(videoUri).path ?: "") } catch (_: Exception) { null }
-                if (videoFile == null || !videoFile.exists()) {
-                    val result: WritableMap = Arguments.createMap().apply {
-                        putBoolean("ok", false)
-                        putString("id", id)
-                        putString("destination", destination)
-                        putString("error", "The video file no longer exists. Please select a new video.")
-                        putString("errorCode", "VIDEO_NOT_FOUND")
-                    }
-                    promise.resolve(result)
-                    return
-                }
-            }
-
+            Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio")
+            
             saveWallpaperConfig(id, kind, videoUri, loop, playbackDuration, audio, "")
             val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
-            val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
-                putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val flags = when (destination.uppercase()) {
+                "HOME" -> WallpaperManager.FLAG_SYSTEM
+                "LOCK" -> WallpaperManager.FLAG_LOCK
+                "BOTH" -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+                else -> throw IllegalArgumentException("Unknown wallpaper destination: $destination")
             }
-            startPickerActivity(intent)
+            openWallpaperConfirmation(component, flags)
 
             val result: WritableMap = Arguments.createMap().apply {
                 putBoolean("ok", true)
                 putString("id", id)
                 putString("destination", destination)
-                putString("mode", "native-wallpaper-service")
+                putString("mode", "system-wallpaper-confirmation-$destination")
             }
             promise.resolve(result)
         } catch (error: Exception) {
@@ -163,19 +164,11 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             return
         }
         videoPromise = promise
-        val documentIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        Log.i(TAG, "Opening video picker: action=${Intent.ACTION_OPEN_DOCUMENT}")
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "video/*"
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-        }
-        val intent = if (documentIntent.resolveActivity(reactContext.packageManager) != null) {
-            documentIntent
-        } else {
-            Intent(Intent.ACTION_GET_CONTENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "video/*"
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
         }
         try {
             reactContext.startActivityForResult(intent, VIDEO_REQUEST_CODE, null)
@@ -186,77 +179,84 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         }
     }
 
-    @ReactMethod
-    fun openWallpaperPicker(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, accent: String, audio: Boolean, promise: Promise) {
-        try {
-            // For video wallpapers, validate the video file exists
-            if (kind == "video" && videoUri.isNotBlank()) {
-                val videoFile = try { File(Uri.parse(videoUri).path ?: "") } catch (_: Exception) { null }
-                if (videoFile == null || !videoFile.exists()) {
-                    promise.reject("VIDEO_NOT_FOUND", "The video file no longer exists. Please select a new video.")
-                    return
-                }
-            }
-
-            saveWallpaperConfig(id, kind, videoUri, loop, playbackDuration, audio, accent)
-            val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
-            val appPreviewIntent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
-                putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            try {
-                // Do not preflight with resolveActivity: some Android launchers hide their
-                // picker from package-visibility queries until it has already been opened.
-                startPickerActivity(appPreviewIntent)
-            } catch (_: ActivityNotFoundException) {
-                val genericPickerIntent = Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                startPickerActivity(genericPickerIntent)
-            }
-            promise.resolve(true)
-        } catch (error: Exception) {
-            Log.e(TAG, "Failed to open wallpaper picker", error)
-            promise.reject("PICKER_ERROR", "Unable to open the wallpaper picker: ${error.message}", error)
-        }
-    }
-
     private fun saveWallpaperConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String) {
-        val preferences = reactContext.getSharedPreferences("wallpaper", 0)
+        val preferences = reactContext.getSharedPreferences("wallpaper_pref", 0)
+        val finalAccent = if (accent.isNotBlank()) accent else "#7C3AED"
+        
+        Log.i(TAG, "SAVING CONFIG TO SharedPreferences: kind=$kind, path=$videoUri")
+        
         preferences.edit()
-            .putString("wallpaperId", id)
-            .putString("wallpaperKind", kind)
-            .putString("videoUri", videoUri)
-            .putBoolean("loop", loop)
-            .putInt("playbackDuration", playbackDuration.coerceIn(1, 30))
-            .putBoolean("audio", audio)
-            .putString("accent", accent.ifBlank { preferences.getString("accent", "#7C3AED") })
+            .putString("W_ID", id)
+            .putString("W_KIND", kind)
+            .putString("W_PATH", videoUri)
+            .putBoolean("W_LOOP", loop)
+            .putInt("W_DURATION", playbackDuration.coerceIn(1, 30))
+            .putBoolean("W_AUDIO", audio)
+            .putString("W_ACCENT", finalAccent)
             .commit()
+
+        val check = preferences.getString("W_PATH", "FAILED")
+        Log.i(TAG, "VERIFY SAVED PATH: $check")
     }
 
     private fun startPickerActivity(intent: Intent) {
         val activity = reactContext.currentActivity
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         if (activity != null) {
             activity.startActivity(intent)
         } else {
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             reactContext.startActivity(intent)
         }
     }
 
-    /**
-     * Extract duration from a video file. Returns 30f on failure.
-     */
-    private fun extractVideoDuration(videoFile: File): Float {
+    private fun openWallpaperConfirmation(component: ComponentName, flags: Int) {
+        val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+            putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
+            putExtra("com.wall_e.WALLPAPER_DESTINATION", flags)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        Log.i(TAG, "Opening wallpaper confirmation: component=$component flags=$flags")
+        startPickerActivity(intent)
+    }
+
+    private fun copyVideoToAppStorage(uri: Uri): Uri {
+        val videoDirectory = File(reactContext.filesDir, "wallpapers").apply { mkdirs() }
+        val videoFile = File(videoDirectory, "video_${System.currentTimeMillis()}.mp4")
+        val input = reactContext.contentResolver.openInputStream(uri)
+            ?: throw IOException("Unable to open the selected video")
+
+        try {
+            input.use { source ->
+                videoFile.outputStream().use { destination -> source.copyTo(destination) }
+            }
+            Log.i(TAG, "Copied video details: exists=${videoFile.exists()} bytes=${videoFile.length()} readable=${videoFile.canRead()}")
+            Log.i(TAG, "Copied selected video to app storage: ${videoFile.absolutePath}")
+            return Uri.fromFile(videoFile)
+        } catch (error: Exception) {
+            videoFile.delete()
+            throw IOException("Unable to copy the selected video into app storage", error)
+        }
+    }
+
+    /** Return duration only when the URI exposes a real video track. */
+    private fun extractVideoDuration(uri: Uri): Float? {
         var retriever: MediaMetadataRetriever? = null
         return try {
+            Log.i(TAG, "Reading video metadata: uri=$uri scheme=${uri.scheme}")
             retriever = MediaMetadataRetriever()
-            retriever.setDataSource(videoFile.absolutePath)
-            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 1000L
-            (durationMs / 1000f).coerceAtLeast(1f)
+            retriever.setDataSource(reactContext, uri)
+            val durationMs = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+            val hasVideoTrack = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)
+                ?.equals("yes", ignoreCase = true) == true
+            Log.i(TAG, "Video metadata: durationMs=$durationMs hasVideoTrack=$hasVideoTrack")
+            if (!hasVideoTrack || durationMs == null || durationMs <= 0L) null
+            else (durationMs / 1000f).coerceAtLeast(1f)
         } catch (error: Exception) {
-            Log.w(TAG, "Could not extract video duration, defaulting to 30s", error)
-            30f
+            Log.w(TAG, "Could not read selected video metadata", error)
+            null
         } finally {
             try {
                 retriever?.release()

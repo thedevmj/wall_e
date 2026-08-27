@@ -3,4 +3,5 @@
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:label="Live Wallpaper Studio"
     android:description="@string/wallpaper_description"
-    android:thumbnail="@mipmap/ic_launcher" />
+    android:thumbnail="@mipmap/ic_launcher"
+    android:settingsActivity="com.wall_e.MainActivity" />

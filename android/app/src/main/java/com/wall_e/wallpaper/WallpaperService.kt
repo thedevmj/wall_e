@@ -71,6 +71,7 @@ class LiveWallpaperService : WallpaperService() {
         private var secondaryColor = Color.parseColor("#22D3EE")
         private var shouldLoop = true
         private var includeAudio = false
+        private var playbackDuration = 30          // seconds from W_DURATION (default 30)
         private var videoFailed = false
         private var videoErrorMessage = ""
         private var isPlayerReady = false
@@ -169,8 +170,9 @@ class LiveWallpaperService : WallpaperService() {
                 } else {
                     synchronized(playerLock) {
                         if (!shouldLoop) {
-                            Log.i(TAG, "Unlock detected: restarting one-shot video from the beginning")
-                            exoPlayer?.seekTo(0L)
+                            Log.i(TAG, "Unlock: holding one-shot at final frame")
+                            val durationMs = playbackDuration * 1000L
+                            exoPlayer?.seekTo(durationMs.coerceAtMost(durationMs))
                         }
                         exoPlayer?.play()
                     }
@@ -323,6 +325,25 @@ class LiveWallpaperService : WallpaperService() {
                     setMediaItem(mediaItem)
                     prepare()
                     play()
+
+                    // Enforce playback duration (W_DURATION) for both loop and one-shot.
+                    val durationMs = playbackDuration * 1000L
+                    val enforceDuration = object : Runnable {
+                        override fun run() {
+                            synchronized(playerLock) {
+                                val pos = exoPlayer?.currentPosition ?: 0
+                                if (pos >= durationMs) {
+                                    if (shouldLoop) {
+                                        exoPlayer?.seekTo(0L)
+                                    } else {
+                                        exoPlayer?.seekTo(durationMs.coerceAtMost(durationMs))
+                                    }
+                                }
+                            }
+                            mainHandler.postDelayed(this, 500)
+                        }
+                    }
+                    mainHandler.postDelayed(enforceDuration, 500)
                 }
             }
         }
@@ -345,7 +366,8 @@ class LiveWallpaperService : WallpaperService() {
             try {
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(this@LiveWallpaperService, videoUri)
-                val durationMs = retriever
+                val durationMs = (playbackDuration * 1000L).coerceAtLeast(1L)
+                val videoDurationMs = retriever
                     .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                     ?.toLongOrNull() ?: 0L
                 if (durationMs <= 0L) {
@@ -417,7 +439,12 @@ class LiveWallpaperService : WallpaperService() {
             }
             val videoFullyReady = isVideoActive && isPlayerReady && !videoFailed
 
-            if (!videoFullyReady) {
+            val videoFailedOnly = synchronized(playerLock) {
+                wallpaperKind == "video" && videoFailed
+            }
+
+            if (!videoFullyReady && videoFailedOnly) {
+                // Only draw error message for actual failure; skip redraw during brief load to avoid flicker.
                 var canvas: Canvas? = null
                 try {
                     canvas = holder.lockCanvas()
@@ -486,6 +513,7 @@ class LiveWallpaperService : WallpaperService() {
             configuredVideoUriString = preferences.getString("W_PATH", "").orEmpty()
             shouldLoop = preferences.getBoolean("W_LOOP", true)
             includeAudio = preferences.getBoolean("W_AUDIO", false)
+            playbackDuration = preferences.getInt("W_DURATION", 30).coerceIn(1, 30)
 
             val accentStr = preferences.getString("W_ACCENT", "#7C3AED") ?: "#7C3AED"
             accentColor = try { Color.parseColor(accentStr) } catch (_: Exception) { Color.parseColor("#7C3AED") }

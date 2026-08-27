@@ -242,3 +242,9 @@ The Android compile currently passes. The React Native Jest render test currentl
 - Keep permission behavior API-aware: `READ_MEDIA_VIDEO` on API 33+, `READ_EXTERNAL_STORAGE` on API 32 and below.
 - Validate native changes with `android\gradlew.bat :app:compileDebugKotlin` and JavaScript changes with `npm test -- --runInBand`.
 - Avoid broad refactors while fixing playback or picker behavior.
+
+## Recent Fixes (Implemented)
+- Non-loop (`loop = false`): `WallpaperService` holds at final frame (`seekTo(durationMs)`) instead of restarting (`seekTo(0L)`).
+- Playback duration (`W_DURATION`): enforced via `ExoPlayer` timer (`postDelayed` every 500ms) and `startFrameFallback` uses `playbackDuration * 1000L`; works for both `HOME` and `LOCK`.
+- `HOME` applies only to system/home screen (`WallpaperManager.FLAG_SYSTEM`); picker flags separate `HOME`/`LOCK`/`BOTH`.
+- Preview (`App.tsx`): `Video` uses `viewType={ViewType.TEXTURE}` with `controls` removed and `playInBackground={true}`.

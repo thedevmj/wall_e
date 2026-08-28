@@ -1,5 +1,6 @@
 package com.wall_e.wallpaper
 
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -72,9 +73,11 @@ class LiveWallpaperService : WallpaperService() {
         private var shouldLoop = true
         private var includeAudio = false
         private var playbackDuration = 30          // seconds from W_DURATION (default 30)
+        private var videoRotationDegrees = 0       // degrees from W_ROTATION (0/90/180/270)
         private var videoFailed = false
         private var videoErrorMessage = ""
         private var isPlayerReady = false
+        private var enforceDurationRunnable: Runnable? = null
         private var frameFallbackRetriever: MediaMetadataRetriever? = null
         private var frameFallbackDurationUs = 0L
         private var frameFallbackBitmap: android.graphics.Bitmap? = null
@@ -82,6 +85,7 @@ class LiveWallpaperService : WallpaperService() {
         private var frameFallbackFinished = false
         private val frameFallbackIntervalMs = 33L
         private var frameFallbackRunning = false
+        private var staticBitmap: android.graphics.Bitmap? = null
 
         private val decodeFallbackFrame = object : Runnable {
             override fun run() {
@@ -133,8 +137,9 @@ class LiveWallpaperService : WallpaperService() {
             super.onSurfaceCreated(holder)
             Log.i(TAG, "ON_SURFACE_CREATED: valid=${holder.surface.isValid}")
             loadConfiguration()
+            loadStaticImage()
             startExoPlayer(holder)
-            startRendering()
+            refreshRendering()
         }
 
         override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -144,6 +149,10 @@ class LiveWallpaperService : WallpaperService() {
                 synchronized(playerLock) {
                     exoPlayer?.setVideoSurface(holder.surface)
                 }
+            } else if (wallpaperKind == "static") {
+                // Orientation/size changes need a fresh paint of the still image.
+                stopRendering()
+                startRendering()
             }
         }
 
@@ -153,6 +162,7 @@ class LiveWallpaperService : WallpaperService() {
             stopRendering()
             releaseExoPlayer()
             releaseFrameFallback()
+            releaseStaticImage()
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
@@ -166,6 +176,8 @@ class LiveWallpaperService : WallpaperService() {
                 if (previousKind != wallpaperKind || previousUri != configuredVideoUriString) {
                     Log.i(TAG, "URI CHANGED: $previousUri -> $configuredVideoUriString")
                     releaseExoPlayer()
+                    releaseStaticImage()
+                    loadStaticImage()
                     startExoPlayer(surfaceHolder)
                 } else {
                     synchronized(playerLock) {
@@ -187,7 +199,7 @@ class LiveWallpaperService : WallpaperService() {
                         frameDecoderHandler.post(decodeFallbackFrame)
                     }
                 }
-                startRendering()
+                refreshRendering()
             } else {
                 synchronized(playerLock) {
                     exoPlayer?.pause()
@@ -294,6 +306,7 @@ class LiveWallpaperService : WallpaperService() {
                             if (state == Player.STATE_READY) {
                                 isPlayerReady = true
                                 videoFailed = false
+                                refreshRendering()
                             }
                         }
 
@@ -316,7 +329,7 @@ class LiveWallpaperService : WallpaperService() {
                             videoFailed = true
                             videoErrorMessage = "Playback error: ${error.errorCodeName}"
                             startFrameFallback(videoUri)
-                            mainHandler.post { startRendering() }
+                            mainHandler.post { refreshRendering() }
                         }
                     })
 
@@ -328,7 +341,8 @@ class LiveWallpaperService : WallpaperService() {
 
                     // Enforce playback duration (W_DURATION) for both loop and one-shot.
                     val durationMs = playbackDuration * 1000L
-                    val enforceDuration = object : Runnable {
+                    mainHandler.removeCallbacks(enforceDurationRunnable ?: Runnable {})
+                    enforceDurationRunnable = object : Runnable {
                         override fun run() {
                             synchronized(playerLock) {
                                 val pos = exoPlayer?.currentPosition ?: 0
@@ -343,7 +357,7 @@ class LiveWallpaperService : WallpaperService() {
                             mainHandler.postDelayed(this, 500)
                         }
                     }
-                    mainHandler.postDelayed(enforceDuration, 500)
+                    mainHandler.postDelayed(enforceDurationRunnable!!, 500)
                 }
             }
         }
@@ -355,6 +369,8 @@ class LiveWallpaperService : WallpaperService() {
         }
 
         private fun releaseExoPlayerLocked() {
+            mainHandler.removeCallbacks(enforceDurationRunnable ?: Runnable {})
+            enforceDurationRunnable = null
             exoPlayer?.stop()
             exoPlayer?.release()
             exoPlayer = null
@@ -410,12 +426,64 @@ class LiveWallpaperService : WallpaperService() {
         private fun renderFrameFallback(canvas: Canvas): Boolean {
             synchronized(frameLock) {
                 val bitmap = frameFallbackBitmap ?: return false
-                val source = android.graphics.Rect(0, 0, bitmap.width, bitmap.height)
-                val destination = android.graphics.Rect(0, 0, canvas.width, canvas.height)
-                canvas.drawColor(Color.BLACK)
-                canvas.drawBitmap(bitmap, source, destination, videoPaint)
+                drawRotatedBitmap(canvas, bitmap)
                 return true
             }
+        }
+
+        private fun renderStaticImage(canvas: Canvas): Boolean {
+            val bitmap = staticBitmap ?: return false
+            drawRotatedBitmap(canvas, bitmap)
+            return true
+        }
+
+        private fun drawRotatedBitmap(canvas: Canvas, bitmap: android.graphics.Bitmap) {
+            val canvasWidth = canvas.width
+            val canvasHeight = canvas.height
+            val saveCount = canvas.save()
+
+            if (videoRotationDegrees != 0) {
+                val rotateCenterWidth = canvasWidth / 2f
+                val rotateCenterHeight = canvasHeight / 2f
+                canvas.rotate(videoRotationDegrees.toFloat(), rotateCenterWidth, rotateCenterHeight)
+            }
+
+            canvas.drawColor(Color.BLACK)
+            val source = android.graphics.Rect(0, 0, bitmap.width, bitmap.height)
+
+            if (videoRotationDegrees == 90 || videoRotationDegrees == 270) {
+                val scaleX = canvasWidth.toFloat() / bitmap.height
+                val scaleY = canvasHeight.toFloat() / bitmap.width
+                val scale = minOf(scaleX, scaleY)
+                val drawWidth = bitmap.height * scale
+                val drawHeight = bitmap.width * scale
+                val left = (canvasWidth - drawWidth) / 2f
+                val top = (canvasHeight - drawHeight) / 2f
+                val destination = android.graphics.Rect(
+                    left.toInt(),
+                    top.toInt(),
+                    (left + drawWidth).toInt(),
+                    (top + drawHeight).toInt(),
+                )
+                canvas.drawBitmap(bitmap, source, destination, videoPaint)
+            } else {
+                val scaleX = canvasWidth.toFloat() / bitmap.width
+                val scaleY = canvasHeight.toFloat() / bitmap.height
+                val scale = minOf(scaleX, scaleY)
+                val drawWidth = bitmap.width * scale
+                val drawHeight = bitmap.height * scale
+                val left = (canvasWidth - drawWidth) / 2f
+                val top = (canvasHeight - drawHeight) / 2f
+                val destination = android.graphics.Rect(
+                    left.toInt(),
+                    top.toInt(),
+                    (left + drawWidth).toInt(),
+                    (top + drawHeight).toInt(),
+                )
+                canvas.drawBitmap(bitmap, source, destination, videoPaint)
+            }
+
+            canvas.restoreToCount(saveCount)
         }
 
         private fun startRendering() {
@@ -430,6 +498,29 @@ class LiveWallpaperService : WallpaperService() {
             choreographer.removeFrameCallback(this)
         }
 
+        /**
+         * Only run the display-driven frame loop when we actually need to paint
+         * (doodles, frame-fallback video, or the error screen). When ExoPlayer
+         * renders directly to the wallpaper surface we keep the loop off so the
+         * device is not woken every frame for nothing — smoother and lighter on
+         * battery while the video plays.
+         */
+        private fun refreshRendering() {
+            synchronized(playerLock) {
+                val videoOwnsSurface =
+                    wallpaperKind == "video" &&
+                        exoPlayer != null &&
+                        isPlayerReady &&
+                        !videoFailed &&
+                        videoErrorMessage.isBlank()
+                if (videoOwnsSurface) {
+                    stopRendering()
+                } else {
+                    startRendering()
+                }
+            }
+        }
+
         override fun doFrame(frameTimeNanos: Long) {
             if (!isRendering) return
             val holder = surfaceHolder ?: return
@@ -439,12 +530,11 @@ class LiveWallpaperService : WallpaperService() {
             }
             val videoFullyReady = isVideoActive && isPlayerReady && !videoFailed
 
-            val videoFailedOnly = synchronized(playerLock) {
-                wallpaperKind == "video" && videoFailed
+            val drawWithCanvas = synchronized(playerLock) {
+                wallpaperKind == "static" || (wallpaperKind == "video" && videoFailed)
             }
 
-            if (!videoFullyReady && videoFailedOnly) {
-                // Only draw error message for actual failure; skip redraw during brief load to avoid flicker.
+            if (drawWithCanvas) {
                 var canvas: Canvas? = null
                 try {
                     canvas = holder.lockCanvas()
@@ -457,6 +547,12 @@ class LiveWallpaperService : WallpaperService() {
                     canvas?.let {
                         try { holder.unlockCanvasAndPost(it) } catch (_: Exception) {}
                     }
+                }
+
+                if (wallpaperKind == "static") {
+                    // A still image only needs a single paint; stop the loop to save battery.
+                    stopRendering()
+                    return
                 }
             }
 
@@ -474,6 +570,16 @@ class LiveWallpaperService : WallpaperService() {
             val centerX = canvas.width / 2f
             val centerY = canvas.height / 2f
             val size = canvas.width.coerceAtMost(canvas.height)
+
+            if (wallpaperKind == "static") {
+                if (renderStaticImage(canvas)) return
+                canvas.drawColor(accentColor)
+                secondaryPaint.color = Color.WHITE
+                secondaryPaint.textSize = size * 0.05f
+                secondaryPaint.textAlign = Paint.Align.CENTER
+                canvas.drawText("No image selected", centerX, centerY, secondaryPaint)
+                return
+            }
 
             if (wallpaperKind == "video") {
                 if (renderFrameFallback(canvas)) return
@@ -514,11 +620,12 @@ class LiveWallpaperService : WallpaperService() {
             shouldLoop = preferences.getBoolean("W_LOOP", true)
             includeAudio = preferences.getBoolean("W_AUDIO", false)
             playbackDuration = preferences.getInt("W_DURATION", 30).coerceIn(1, 30)
+            videoRotationDegrees = preferences.getInt("W_ROTATION", 0).coerceIn(0, 270)
 
             val accentStr = preferences.getString("W_ACCENT", "#7C3AED") ?: "#7C3AED"
             accentColor = try { Color.parseColor(accentStr) } catch (_: Exception) { Color.parseColor("#7C3AED") }
 
-            Log.i(TAG, "LOAD CONFIG: kind=$wallpaperKind, path=$configuredVideoUriString")
+            Log.i(TAG, "LOAD CONFIG: kind=$wallpaperKind, path=$configuredVideoUriString, rotation=$videoRotationDegrees")
             if (configuredVideoUriString.startsWith("file://")) {
                 val configuredFile = File(Uri.parse(configuredVideoUriString).path ?: "")
                 Log.i(TAG, "Configured file: path=${configuredFile.absolutePath} exists=${configuredFile.exists()} bytes=${configuredFile.length()} readable=${configuredFile.canRead()}")
@@ -528,6 +635,38 @@ class LiveWallpaperService : WallpaperService() {
             Color.colorToHSV(accentColor, hsv)
             hsv[0] = (hsv[0] + 180) % 360
             secondaryColor = Color.HSVToColor(hsv)
+        }
+
+        private fun loadStaticImage() {
+            releaseStaticImage()
+            if (wallpaperKind != "static") return
+            if (configuredVideoUriString.isBlank()) {
+                Log.e(TAG, "LOAD STATIC: no image path configured")
+                return
+            }
+            try {
+                val uri = Uri.parse(configuredVideoUriString)
+                val bitmap = if (uri.scheme == "content") {
+                    BitmapFactory.decodeStream(contentResolver.openInputStream(uri))
+                } else if (uri.scheme == "file") {
+                    BitmapFactory.decodeFile(uri.path)
+                } else {
+                    BitmapFactory.decodeFile(configuredVideoUriString)
+                }
+                if (bitmap == null) {
+                    Log.e(TAG, "LOAD STATIC: failed to decode image at $configuredVideoUriString")
+                    return
+                }
+                staticBitmap = bitmap
+                Log.i(TAG, "LOAD STATIC: decoded ${bitmap.width}x${bitmap.height}")
+            } catch (error: Exception) {
+                Log.e(TAG, "LOAD STATIC: failed to load image", error)
+            }
+        }
+
+        private fun releaseStaticImage() {
+            staticBitmap?.recycle()
+            staticBitmap = null
         }
     }
 

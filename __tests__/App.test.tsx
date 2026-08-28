@@ -27,9 +27,13 @@ test('renders wallpaper studio home screen', async () => {
     const text = Array.isArray(node.props.children)
       ? node.props.children.join('')
       : String(node.props.children ?? '');
-    return text.includes('Live Wallpaper Studio');
+    return text.includes('LiveWallpaper Studio');
   });
 
   expect(hasTitle).toBe(true);
   expect(textNodes.length).toBeGreaterThan(10);
+
+  await ReactTestRenderer.act(async () => {
+    component!.unmount();
+  });
 });

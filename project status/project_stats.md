@@ -75,8 +75,8 @@ The wallpaper service receives an app-owned file that remains readable after the
   - `WallpaperCapabilities`, `WallpaperApplyResult`, and `WallpaperError` contracts.
 
 - `src/data/mockWallpapers.ts`
-  - Three initial in-memory examples: two doodles and one video.
-  - These are mock library entries; the mock video has no local playable URI until replaced by the user.
+  - Three initial in-memory examples (mock library) plus `predefinedWallpapers`: four ready-made featured wallpapers (Aurora Drift, Sunset Pulse, Spark Bloom, Midnight Ocean) that seed the home screen billboard and the 2x2 grid.
+  - All four predefined wallpapers are `doodle` kind. Sunset Pulse and Midnight Ocean were previously marked `video` but had no bundled video file, so preview and Apply could not work for them. Since there are no bundled video assets, making them doodles lets every built-in wallpaper preview and apply through the native doodle renderer with no extra setup.
 
 - `src/services/wallpaperBridge.ts`
   - Typed defensive wrapper around `NativeModules.WallpaperModule`.
@@ -112,6 +112,7 @@ The wallpaper service receives an app-owned file that remains readable after the
   - Uses `SharedPreferences` file `wallpaper_pref` for the active wallpaper configuration.
   - `applyWallpaper`: saves config and starts `ACTION_CHANGE_LIVE_WALLPAPER` for the app service. It maps HOME/LOCK/BOTH to Android wallpaper flags for the confirmation flow.
   - `copyVideoToAppStorage`: writes videos under the app internal `filesDir/wallpapers` directory, so no external file path or service URI grant is needed at playback time.
+  - The picker result handler now copies the file and reads duration on a background `Thread` and resolves the JS promise via `reactContext.runOnUiQueueThread`, so importing a large video no longer stalls the React preview/UI thread.
   - Current behavior does not delete old copied videos when a video is replaced or deleted. This is a future storage cleanup task.
 
 - `android/app/src/main/java/com/wall_e/wallpaper/WallpaperService.kt`
@@ -128,6 +129,8 @@ The wallpaper service receives an app-owned file that remains readable after the
   - Logs metadata, player state, playback exceptions, decoder details, and available decoders.
   - Displays a native fallback message if the video cannot be loaded.
   - Releases ExoPlayer when the wallpaper surface is destroyed or configuration changes.
+  - Rendering-performance change: `refreshRendering()` keeps the display-driven Choreographer frame loop ON only when the service must paint itself (doodles, frame-fallback playback, or the error screen). When ExoPlayer is ready and rendering directly to the surface, the frame loop is turned OFF so the wallpaper does not wake the device every frame for nothing. The player state listener re-enables the loop on error.
+  - The W_DURATION enforcement runnable is now stored in a field and removed from the main handler whenever the player is released or restarted, so repeated visibility changes no longer pile up unbounded timers.
 
 ## Native Configuration Contract
 
@@ -244,7 +247,25 @@ The Android compile currently passes. The React Native Jest render test currentl
 - Avoid broad refactors while fixing playback or picker behavior.
 
 ## Recent Fixes (Implemented)
+- Built-in wallpapers now work end-to-end: every predefined wallpaper is a `doodle`, so Preview shows the animated pre-renderer and Apply always reaches the native doodle renderer (no "Choose a video before applying" dead end for wallpapers that ship with the app).
+- Video import is smoother: the copy + duration probe run on a background thread and the promise resolves on the React UI queue, so the preview does not jank while a large video is imported.
+- `WallpaperService` stops the Choreographer frame loop while ExoPlayer renders directly to the surface and re-enables it for doodles, frame-fallback playback, and error screens (battery/CPU win; the previous loop posted empty frame callbacks continuously during video playback).
+- The W_DURATION enforcement timer and the frame-fallback decode task are now cancelled/removed when the player is released, so visibility toggles no longer leak Runnables.
 - Non-loop (`loop = false`): `WallpaperService` holds at final frame (`seekTo(durationMs)`) instead of restarting (`seekTo(0L)`).
 - Playback duration (`W_DURATION`): enforced via `ExoPlayer` timer (`postDelayed` every 500ms) and `startFrameFallback` uses `playbackDuration * 1000L`; works for both `HOME` and `LOCK`.
 - `HOME` applies only to system/home screen (`WallpaperManager.FLAG_SYSTEM`); picker flags separate `HOME`/`LOCK`/`BOTH`.
 - Preview (`App.tsx`): `Video` uses `viewType={ViewType.TEXTURE}` with `controls` removed and `playInBackground={true}`.
+
+## Recent UI Updates
+- Modal panels (Create wallpaper and wallpaper detail) are now an opaque `#0B1526` card instead of a translucent glass card, so the create card is fully readable over the dark backdrop.
+- Replaced the previous metric/action/footer layout with a clean, professional home screen:
+  - Header shows the app icon (`assets/app-icon.png`, resized from `images/file_000000008aac820bb73abb65891e0864.png`) next to the app name `LiveWallpaper Studio`.
+  - A featured `Billboard` rotates through all wallpapers every 5 seconds with a cross-fade and tappable pagination dots. The billboard card uses an abstract `GeometricArt` panel with a dark scrim and shows kind, name, and description.
+  - A `Predefined wallpapers` 2x2 grid shows the ready-made wallpapers (name + kind chip + duration) over colorful geometric artwork.
+  - Removed the metrics row (Library/SDK/Native), the Create Doodle/Video buttons, the filter row, and the Android runtime footer panel as unnecessary info.
+  - The floating `Create` FAB opens the wallpaper creation modal; created wallpapers are prepended to the billboard rotation.
+- Added `src/components/GeometricArt.tsx`: a View-only abstract composition (tinted blobs, accent ring, white diamond, deep orb, triangle, dots) that derives a palette from each wallpaper's accent color and varies by seed index, so every predefined wallpaper looks distinct.
+- New app launcher icons generated from the source artwork PNG into `mipmap-mdpi..xxxhdpi` for `ic_launcher.png` (square) and `ic_launcher_round.png` (circular crop).
+- App display name updated to `LiveWallpaper Studio` in `app.json` and `android/app/src/main/res/values/strings.xml`.
+- The Jest render test now asserts `LiveWallpaper Studio` and unmounts the rendered component so the billboard interval is cleared after the test (removes the open-async-handle noise).
+- Removed the unused capabilities/loading skeleton state from `App()` since the home screen no longer shows SDK/native metrics.

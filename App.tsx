@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Image,
   Modal,
   Pressable,
   SafeAreaView,
@@ -20,8 +21,8 @@ import {
   PanResponder,
 } from 'react-native';
 import { ActionButton } from './src/components/ActionButton';
-import { WallpaperCard } from './src/components/WallpaperCard';
-import { mockWallpapers } from './src/data/mockWallpapers';
+import { GeometricArt } from './src/components/GeometricArt';
+import { predefinedWallpapers } from './src/data/mockWallpapers';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
 import type { Wallpaper } from './src/types';
 import Video, { ViewType } from 'react-native-video';
@@ -74,15 +75,18 @@ type CreateModalProps = {
 };
 
 function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps) {
-  const [editorKind, setEditorKind] = React.useState<'doodle' | 'video'>('doodle');
+  const [editorKind, setEditorKind] = React.useState<'doodle' | 'video' | 'static'>('doodle');
   const [title, setTitle] = React.useState('');
   const [videoUri, setVideoUri] = React.useState<string | null>(null);
+  const [imageUri, setImageUri] = React.useState<string | null>(null);
+  const [videoRotation, setVideoRotation] = React.useState(0);
   const [loopVideo, setLoopVideo] = React.useState(true);
   const [videoAudio, setVideoAudio] = React.useState(false);
   const [playbackDuration, setPlaybackDuration] = React.useState(30);
   const [sliderWidth, setSliderWidth] = React.useState(0);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const [isPickingVideo, setIsPickingVideo] = React.useState(false);
+  const [isPickingImage, setIsPickingImage] = React.useState(false);
 
   const updateDuration = React.useCallback(
     (position: number) => {
@@ -109,11 +113,14 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
     if (visible) {
       setTitle('');
       setVideoUri(null);
+      setImageUri(null);
+      setVideoRotation(0);
       setLoopVideo(true);
       setVideoAudio(false);
       setPlaybackDuration(30);
       setErrorMessage(null);
       setIsPickingVideo(false);
+      setIsPickingImage(false);
     }
   }, [visible]);
 
@@ -128,10 +135,27 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       } else {
         setErrorMessage('No video was selected. Please try again.');
       }
-    } catch (_error) {
+    } catch {
       setErrorMessage('The selected video could not be read. Please choose another video.');
     } finally {
       setIsPickingVideo(false);
+    }
+  }, []);
+
+  const chooseImage = React.useCallback(async () => {
+    setErrorMessage(null);
+    setIsPickingImage(true);
+    try {
+      const pickedImage = await wallpaperBridge.pickImage();
+      if (pickedImage) {
+        setImageUri(pickedImage.uri);
+      } else {
+        setErrorMessage('No image was selected. Please try again.');
+      }
+    } catch {
+      setErrorMessage('The selected image could not be read. Please choose another image.');
+    } finally {
+      setIsPickingImage(false);
     }
   }, []);
 
@@ -140,7 +164,11 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       setErrorMessage('Choose a video before creating this wallpaper.');
       return;
     }
-    const name = title.trim() || (editorKind === 'doodle' ? 'Untitled Doodle' : 'Untitled Video');
+    if (editorKind === 'static' && !imageUri) {
+      setErrorMessage('Choose an image before creating this wallpaper.');
+      return;
+    }
+    const name = title.trim() || (editorKind === 'doodle' ? 'Untitled Doodle' : editorKind === 'video' ? 'Untitled Video' : 'Untitled Image');
     const newWallpaper: Wallpaper = {
       id: `${editorKind}-${Date.now()}`,
       title: name,
@@ -148,18 +176,22 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       description:
         editorKind === 'doodle'
           ? 'A custom animated doodle loop.'
-          : 'A custom muted video wallpaper loop.',
-      accent: editorKind === 'doodle' ? '#22D3EE' : '#FB7185',
+          : editorKind === 'video'
+            ? 'A custom muted video wallpaper loop.'
+            : 'A custom still image wallpaper.',
+      accent: editorKind === 'doodle' ? '#22D3EE' : editorKind === 'video' ? '#FB7185' : '#F59E0B',
       status: 'Needs preview',
-      duration: editorKind === 'doodle' ? '15 sec' : `${playbackDuration} sec`,
+      duration: editorKind === 'doodle' ? '15 sec' : editorKind === 'video' ? `${playbackDuration} sec` : 'Still',
       createdAt: 'Just now',
       videoUri: editorKind === 'video' ? videoUri ?? undefined : undefined,
+      imageUri: editorKind === 'static' ? imageUri ?? undefined : undefined,
       loop: editorKind === 'video' ? loopVideo : undefined,
       audio: editorKind === 'video' ? videoAudio : undefined,
       playbackDuration: editorKind === 'video' ? playbackDuration : undefined,
+      rotation: editorKind === 'video' ? videoRotation : undefined,
     };
     onCreated(newWallpaper);
-  }, [editorKind, title, videoUri, loopVideo, videoAudio, playbackDuration, onCreated]);
+  }, [editorKind, title, videoUri, imageUri, loopVideo, videoAudio, playbackDuration, videoRotation, onCreated]);
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -221,6 +253,25 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
                   ]}
                 />
               </View>
+              <Text style={styles.durationLabel}>Rotate video before applying</Text>
+              <View style={styles.rotationRow}>
+                {([0, 90, 180, 270] as const).map(degrees => (
+                  <Pressable
+                    key={degrees}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Rotate ${degrees} degrees`}
+                    onPress={() => setVideoRotation(degrees)}
+                    style={[
+                      styles.rotationButton,
+                      videoRotation === degrees && styles.rotationButtonSelected,
+                    ]}>
+                    <Text style={styles.rotationButtonText}>{degrees}°</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {videoRotation !== 0 && (
+                <Text style={styles.rotationHint}>Video rotates {videoRotation}° clockwise</Text>
+              )}
               <Pressable
                 accessibilityRole="checkbox"
                 accessibilityState={{ checked: loopVideo }}
@@ -239,14 +290,35 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
               </Pressable>
             </>
           )}
+          {editorKind === 'static' && (
+            <>
+              <ActionButton
+                label={
+                  isPickingImage
+                    ? 'Selecting...'
+                    : imageUri
+                      ? 'Image selected ✓'
+                      : 'Choose image from device'
+                }
+                onPress={chooseImage}
+                tone="secondary"
+              />
+              {imageUri && (
+                <Image source={{ uri: imageUri }} style={styles.staticImagePreview} />
+              )}
+              <Text style={styles.staticHint}>
+                Set a still photo as a regular Android wallpaper.
+              </Text>
+            </>
+          )}
           <View style={styles.kindRow}>
-            {(['doodle', 'video'] as const).map(kind => (
+            {(['doodle', 'video', 'static'] as const).map(kind => (
               <Pressable
                 key={kind}
                 onPress={() => setEditorKind(kind)}
                 style={[styles.kindButton, editorKind === kind && styles.kindButtonSelected]}>
                 <Text style={styles.kindButtonText}>
-                  {kind === 'doodle' ? 'Doodle' : 'Video'}
+                  {kind === 'doodle' ? 'Doodle' : kind === 'video' ? 'Video' : 'Static'}
                 </Text>
               </Pressable>
             ))}
@@ -268,20 +340,31 @@ type DetailModalProps = {
   wallpaper: Wallpaper | null;
   onClose: () => void;
   onApplied: (id: string) => void;
-  onVideoChosen: (updated: Wallpaper) => void;
+  onWallpaperUpdated: (updated: Wallpaper) => void;
 };
 
-function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: DetailModalProps) {
+function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdated }: DetailModalProps) {
   const [isApplying, setIsApplying] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const [videoError, setVideoError] = React.useState(false);
+  const [imageError, setImageError] = React.useState(false);
+  const [rotation, setRotation] = React.useState(0);
 
   // Reset errors when wallpaper changes
   React.useEffect(() => {
     setErrorMessage(null);
     setIsApplying(false);
     setVideoError(false);
+    setImageError(false);
+    setRotation(wallpaper?.rotation ?? 0);
   }, [wallpaper?.id]);
+
+  // Persist rotation changes back to the library when it changes.
+  React.useEffect(() => {
+    if (wallpaper && rotation !== (wallpaper.rotation ?? 0)) {
+      onWallpaperUpdated({ ...wallpaper, rotation });
+    }
+  }, [rotation, wallpaper, onWallpaperUpdated]);
 
   const applySelected = React.useCallback(
     async (destination: 'HOME' | 'LOCK' | 'BOTH') => {
@@ -290,28 +373,39 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
         setErrorMessage('Choose a video before applying this wallpaper.');
         return;
       }
+      if (wallpaper.kind === 'static' && !wallpaper.imageUri) {
+        setErrorMessage('Choose an image before applying this wallpaper.');
+        return;
+      }
       setIsApplying(true);
       setErrorMessage(null);
       try {
+        const mediaUri =
+          wallpaper.kind === 'static'
+            ? wallpaper.imageUri ?? ''
+            : wallpaper.videoUri ?? '';
         const result = await wallpaperBridge.applyWallpaper(
           wallpaper.id,
           wallpaper.kind,
           destination,
-          wallpaper.videoUri,
+          mediaUri,
           wallpaper.loop ?? true,
           wallpaper.playbackDuration ?? 30,
           wallpaper.audio ?? false,
+          rotation,
         );
         if (result.ok) {
           onApplied(wallpaper.id);
           Alert.alert(
             'Wallpaper Applied',
-            `"${wallpaper.title}" is being set as your ${destination.toLowerCase()} wallpaper. Follow the system prompt to confirm.`,
+            wallpaper.kind === 'static'
+              ? '"' + wallpaper.title + '" is now your ' + destination.toLowerCase() + ' wallpaper.'
+              : `"${wallpaper.title}" is being set as your ${destination.toLowerCase()} wallpaper. Follow the system prompt to confirm.`,
             [{ text: 'OK' }],
           );
           onClose();
         } else {
-          setErrorMessage(result.error ?? 'Android could not open the live wallpaper picker.');
+          setErrorMessage(result.error ?? 'Android could not open the wallpaper picker.');
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'An unexpected error occurred.';
@@ -320,7 +414,7 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
         setIsApplying(false);
       }
     },
-    [wallpaper, onApplied, onClose],
+    [wallpaper, rotation, onApplied, onClose],
   );
 
   const chooseVideoForSelected = React.useCallback(async () => {
@@ -337,12 +431,32 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
         videoUri: pickedVideo.uri,
         playbackDuration: Math.min(30, Math.max(1, Math.round(pickedVideo.durationSeconds))),
       };
-      onVideoChosen(updatedWallpaper);
+      onWallpaperUpdated(updatedWallpaper);
       setVideoError(false);
-    } catch (_error) {
+    } catch {
       setErrorMessage('The selected video could not be read. Please choose another video.');
     }
-  }, [wallpaper, onVideoChosen]);
+  }, [wallpaper, onWallpaperUpdated]);
+
+  const chooseImageForSelected = React.useCallback(async () => {
+    if (!wallpaper) return;
+    setErrorMessage(null);
+    try {
+      const pickedImage = await wallpaperBridge.pickImage();
+      if (!pickedImage) {
+        setErrorMessage('No image was selected. Please try again.');
+        return;
+      }
+      const updatedWallpaper: Wallpaper = {
+        ...wallpaper,
+        imageUri: pickedImage.uri,
+      };
+      onWallpaperUpdated(updatedWallpaper);
+      setImageError(false);
+    } catch {
+      setErrorMessage('The selected image could not be read. Please choose another image.');
+    }
+  }, [wallpaper, onWallpaperUpdated]);
 
   if (!wallpaper) return null;
 
@@ -359,7 +473,20 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
           )}
 
           {/* Preview */}
-          {wallpaper.kind === 'video' && wallpaper.videoUri && !videoError ? (
+          {wallpaper.kind === 'static' && wallpaper.imageUri && !imageError ? (
+            <Image
+              key={wallpaper.imageUri}
+              source={{ uri: wallpaper.imageUri }}
+              style={styles.staticImagePreview}
+              resizeMode="cover"
+              onError={() => setImageError(true)}
+            />
+          ) : wallpaper.kind === 'static' && imageError ? (
+            <View style={[styles.preview, { backgroundColor: wallpaper.accent }]}>
+              <Text style={styles.previewLabel}>IMAGE PREVIEW UNAVAILABLE</Text>
+              <Text style={styles.videoErrorHint}>Try selecting another image</Text>
+            </View>
+          ) : wallpaper.kind === 'video' && wallpaper.videoUri && !videoError ? (
             <Video
               key={wallpaper.videoUri}
               source={{ uri: wallpaper.videoUri }}
@@ -393,7 +520,24 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
                 Plays for {wallpaper.playbackDuration ?? 30} seconds
                 {wallpaper.loop === false ? ' once' : ' on repeat'}
                 {wallpaper.audio ? ' with audio' : ' muted'}
+                {rotation !== 0 ? ` · rotated ${rotation}°` : ''}
               </Text>
+              <Text style={styles.durationLabel}>Rotate before applying</Text>
+              <View style={styles.rotationRow}>
+                {([0, 90, 180, 270] as const).map(degrees => (
+                  <Pressable
+                    key={degrees}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Rotate video ${degrees} degrees`}
+                    onPress={() => setRotation(degrees)}
+                    style={[
+                      styles.rotationButton,
+                      rotation === degrees && styles.rotationButtonSelected,
+                    ]}>
+                    <Text style={styles.rotationButtonText}>{degrees}°</Text>
+                  </Pressable>
+                ))}
+              </View>
               {(!wallpaper.videoUri || videoError) && (
                 <ActionButton
                   label={videoError ? 'Choose a compatible video' : 'Choose video from device'}
@@ -401,6 +545,21 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onVideoChosen }: 
                   tone="secondary"
                 />
               )}
+            </>
+          )}
+
+          {wallpaper.kind === 'static' && (
+            <>
+              {(!wallpaper.imageUri || imageError) && (
+                <ActionButton
+                  label={imageError ? 'Choose a compatible image' : 'Choose image from device'}
+                  onPress={chooseImageForSelected}
+                  tone="secondary"
+                />
+              )}
+              <Text style={styles.staticHint}>
+                Preview only. Choosing a destination sets this photo directly as a static wallpaper.
+              </Text>
             </>
           )}
 
@@ -460,27 +619,113 @@ function AnimatedPreview({ accent }: { accent: string }) {
   );
 }
 
+// ─── Featured Billboard (auto-rotates every 5 seconds) ───────────────────
+
+const BILLBOARD_INTERVAL_MS = 5000;
+const BILLBOARD_ART_SIZE = 240;
+
+type BillboardProps = {
+  wallpapers: Wallpaper[];
+  onSelect: (wallpaper: Wallpaper) => void;
+};
+
+function Billboard({ wallpapers, onSelect }: BillboardProps) {
+  const [index, setIndex] = React.useState(0);
+  const fade = React.useRef(new Animated.Value(1)).current;
+  const count = wallpapers.length;
+
+  React.useEffect(() => {
+    if (count < 2) return undefined;
+    const timer = setInterval(() => {
+      Animated.timing(fade, { toValue: 0, duration: 240, useNativeDriver: true }).start(() => {
+        setIndex(current => (current + 1) % count);
+        Animated.timing(fade, { toValue: 1, duration: 420, useNativeDriver: true }).start();
+      });
+    }, BILLBOARD_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [count, fade]);
+
+  if (count === 0) return null;
+
+  const current = wallpapers[Math.min(index, count - 1)];
+
+  return (
+    <View style={styles.billboardSection}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Featured: ${current.title}`}
+        onPress={() => onSelect(current)}>
+        <Animated.View style={[styles.billboardCard, { opacity: fade }]}>
+          <View style={styles.billboardArt}>
+            <GeometricArt accent={current.accent} size={BILLBOARD_ART_SIZE} seed={index} />
+          </View>
+          <View style={styles.billboardScrim} />
+          <View style={styles.billboardInfo}>
+            <View style={styles.billboardKindChip}>
+              <Text style={styles.billboardKindText}>{current.kind.toUpperCase()}</Text>
+            </View>
+            <Text style={styles.billboardName}>{current.title}</Text>
+            <Text style={styles.billboardDesc} numberOfLines={1}>
+              {current.description}
+            </Text>
+          </View>
+        </Animated.View>
+      </Pressable>
+
+      <View style={styles.dotsRow}>
+        {wallpapers.map((wallpaper, dotIndex) => (
+          <Pressable
+            key={wallpaper.id}
+            accessibilityRole="button"
+            accessibilityLabel={`Featured wallpaper ${dotIndex + 1}`}
+            onPress={() => setIndex(dotIndex)}
+            style={[styles.dot, dotIndex === index && styles.dotActive]}
+          />
+        ))}
+      </View>
+    </View>
+  );
+}
+
+// ─── Predefined 2x2 Grid ──────────────────────────────────────────────────
+
+type PredefinedGridProps = {
+  wallpapers: Wallpaper[];
+  onSelect: (wallpaper: Wallpaper) => void;
+};
+
+function PredefinedGrid({ wallpapers, onSelect }: PredefinedGridProps) {
+  return (
+    <View style={styles.grid}>
+      {wallpapers.map((wallpaper, seedIndex) => (
+        <Pressable
+          key={wallpaper.id}
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${wallpaper.title}`}
+          onPress={() => onSelect(wallpaper)}
+          style={styles.gridItem}>
+          <View style={styles.gridArt}>
+            <GeometricArt accent={wallpaper.accent} size={140} seed={seedIndex} />
+            <View style={styles.gridKindChip}>
+              <Text style={styles.gridKindText}>{wallpaper.kind.toUpperCase()}</Text>
+            </View>
+          </View>
+          <Text style={styles.gridName}>{wallpaper.title}</Text>
+          <Text style={styles.gridMeta}>{wallpaper.duration}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
 // ─── Main App ────────────────────────────────────────────────────────────
 
 function App() {
-  const [capabilities, setCapabilities] = React.useState({
-    supportsLiveWallpaper: false,
-    minSdk: 24,
-    targetSdk: 36,
-    features: ['Doodle renderer', 'Video preview', 'Wallpaper picker'],
-  });
-  const [wallpapers, setWallpapers] = React.useState(mockWallpapers);
+  const [wallpapers, setWallpapers] = React.useState(predefinedWallpapers);
   const [selectedWallpaper, setSelectedWallpaper] = React.useState<Wallpaper | null>(null);
-  const [filter, setFilter] = React.useState<'all' | 'doodle' | 'video'>('all');
   const [isCreating, setIsCreating] = React.useState(false);
-  const [creatorKind, setCreatorKind] = React.useState<'doodle' | 'video'>('doodle');
 
-  React.useEffect(() => {
-    wallpaperBridge.getCapabilities().then(setCapabilities).catch(() => undefined);
-  }, []);
-
-  const openCreator = React.useCallback((kind: 'doodle' | 'video') => {
-    setCreatorKind(kind);
+  const openCreator = React.useCallback(() => {
     setIsCreating(true);
   }, []);
 
@@ -499,127 +744,55 @@ function App() {
     );
   }, []);
 
-  const handleVideoChosen = React.useCallback((updated: Wallpaper) => {
+  const handleWallpaperUpdated = React.useCallback((updated: Wallpaper) => {
     setSelectedWallpaper(updated);
     setWallpapers(current =>
       current.map(item => (item.id === updated.id ? updated : item)),
     );
   }, []);
 
-  const deleteWallpaper = React.useCallback((id: string) => {
-    Alert.alert('Delete wallpaper?', 'This removes the video from this library.', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: () => setWallpapers(current => current.filter(item => item.id !== id)),
-      },
-    ]);
-  }, []);
-
-  const filteredWallpapers = React.useMemo(
-    () => wallpapers.filter(w => filter === 'all' || w.kind === filter),
-    [wallpapers, filter],
-  );
-
   return (
     <ErrorBoundary>
       <StatusBar barStyle="light-content" />
       <SafeAreaView style={styles.safeArea}>
-        <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
-          <View style={styles.header}>
-            <Text style={styles.eyebrow}>Android wallpaper studio</Text>
-            <Text testID="app-title" style={styles.title}>
-              Live Wallpaper Studio
-            </Text>
-            <Text style={styles.subtitle}>
-              Create, preview, and apply native Android live wallpapers without leaving the app.
-            </Text>
-          </View>
+        <View style={styles.wrapper}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Create wallpaper"
+            style={styles.createFab}
+            onPress={openCreator}>
+            <Text style={styles.createFabText}>Create</Text>
+          </Pressable>
 
-          <View style={styles.metricsRow}>
-            <View style={styles.metricBox}>
-              <Text style={styles.metricLabel}>Library</Text>
-              <Text style={styles.metricValue}>{wallpapers.length}</Text>
+          <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+            {/* Header */}
+            <View style={styles.header}>
+              <View style={styles.brandRow}>
+                <Image source={require('./assets/app-icon.png')} style={styles.brandIcon} />
+                <View style={styles.brandText}>
+                  <Text testID="app-title" style={styles.title}>
+                    LiveWallpaper Studio
+                  </Text>
+                  <Text style={styles.subtitle}>
+                    Create, preview, and apply native Android live wallpapers.
+                  </Text>
+                </View>
+              </View>
             </View>
-            <View style={styles.metricBox}>
-              <Text style={styles.metricLabel}>SDK</Text>
-              <Text style={styles.metricValue}>{capabilities.minSdk}+</Text>
-            </View>
-            <View style={styles.metricBox}>
-              <Text style={styles.metricLabel}>Native</Text>
-              <Text style={styles.metricValue}>
-                {capabilities.supportsLiveWallpaper ? 'ON' : 'OFF'}
-              </Text>
-            </View>
-          </View>
 
-          <View style={styles.actionRow}>
-            <ActionButton label="Create Doodle" onPress={() => openCreator('doodle')} />
-            <ActionButton
-              label="Video Wallpaper"
-              onPress={() => openCreator('video')}
-              tone="secondary"
+            {/* Auto-rotating featured billboard */}
+            <Billboard wallpapers={wallpapers} onSelect={setSelectedWallpaper} />
+
+            {/* Predefined 2x2 grid */}
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.sectionTitle}>Predefined wallpapers</Text>
+            </View>
+            <PredefinedGrid
+              wallpapers={wallpapers.filter(w => w.id.startsWith('pre-'))}
+              onSelect={setSelectedWallpaper}
             />
-          </View>
-
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>My Wallpapers</Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Open library"
-              onPress={() => setFilter('all')}>
-              <Text style={styles.sectionLink}>Open library</Text>
-            </Pressable>
-          </View>
-
-          <View style={styles.filterRow}>
-            {(['all', 'doodle', 'video'] as const).map(option => (
-              <Pressable
-                key={option}
-                accessibilityRole="button"
-                accessibilityState={{ selected: filter === option }}
-                onPress={() => setFilter(option)}
-                style={[styles.filter, filter === option && styles.filterSelected]}>
-                <Text
-                  style={[
-                    styles.filterText,
-                    filter === option && styles.filterTextSelected,
-                  ]}>
-                  {option === 'all' ? 'All' : option === 'doodle' ? 'Doodles' : 'Videos'}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-
-          {filteredWallpapers.length === 0 ? (
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyStateText}>
-                No {filter === 'all' ? '' : filter} wallpapers yet.{'\n'}
-                Tap a button above to create one!
-              </Text>
-            </View>
-          ) : (
-            filteredWallpapers.map((wallpaper, index) => (
-              <WallpaperCard
-                key={wallpaper.id}
-                wallpaper={wallpaper}
-                index={index}
-                onPress={() => setSelectedWallpaper(wallpaper)}
-                onDelete={wallpaper.kind === 'video' ? deleteWallpaper : undefined}
-              />
-            ))
-          )}
-
-          <View style={styles.footerPanel}>
-            <Text style={styles.footerTitle}>Android runtime</Text>
-            <Text style={styles.footerText}>
-              Wallpaper rendering is handled by the native Android service layer, while React
-              Native remains the editor and configuration UI.
-            </Text>
-            <Text style={styles.footerMeta}>{capabilities.features.join(' • ')}</Text>
-          </View>
-        </ScrollView>
+          </ScrollView>
+        </View>
       </SafeAreaView>
 
       <CreateWallpaperModal
@@ -632,7 +805,7 @@ function App() {
         wallpaper={selectedWallpaper}
         onClose={() => setSelectedWallpaper(null)}
         onApplied={handleApplied}
-        onVideoChosen={handleVideoChosen}
+        onWallpaperUpdated={handleWallpaperUpdated}
       />
     </ErrorBoundary>
   );
@@ -643,142 +816,202 @@ function App() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#020817',
+    backgroundColor: '#050E23',
   },
   scroll: {
     flex: 1,
-    backgroundColor: '#020817',
+    backgroundColor: '#050E23',
   },
   content: {
     paddingHorizontal: 18,
-    paddingTop: 18,
+    paddingTop: 14,
     paddingBottom: 36,
   },
   header: {
-    paddingBottom: 18,
+    paddingBottom: 16,
   },
-  eyebrow: {
-    color: '#A5F3FC',
-    fontSize: 12,
-    fontWeight: '700',
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-    marginBottom: 12,
+  brandRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  brandIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 12,
+    marginRight: 12,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+  },
+  brandText: {
+    flex: 1,
   },
   title: {
-    color: '#F8FAFC',
-    fontSize: 32,
+    color: '#F0F8FF',
+    fontSize: 24,
     fontWeight: '800',
-    letterSpacing: -0.8,
-    marginBottom: 10,
+    letterSpacing: -0.4,
+    marginBottom: 3,
   },
   subtitle: {
-    color: '#CBD5E1',
-    fontSize: 15,
-    lineHeight: 21,
+    color: 'rgba(240, 248, 255, 0.78)',
+    fontSize: 13,
+    lineHeight: 19,
   },
-  metricsRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 18,
-    gap: 10,
+  billboardSection: {
+    marginBottom: 22,
   },
-  metricBox: {
-    flex: 1,
-    backgroundColor: '#111827',
-    borderRadius: 16,
-    padding: 16,
+  billboardCard: {
+    height: 176,
+    borderRadius: 22,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
   },
-  metricLabel: {
-    color: '#94A3B8',
-    fontSize: 12,
-    fontWeight: '700',
+  billboardArt: {
+    position: 'absolute',
+    right: -64,
+    top: 8,
+  },
+  billboardScrim: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(3, 8, 26, 0.5)',
+  },
+  billboardInfo: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 14,
+  },
+  billboardKindChip: {
+    alignSelf: 'flex-start',
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
     marginBottom: 8,
   },
-  metricValue: {
-    color: '#F8FAFC',
+  billboardKindText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  billboardName: {
+    color: '#FFFFFF',
     fontSize: 22,
     fontWeight: '800',
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+    marginBottom: 4,
   },
-  actionRow: {
+  billboardDesc: {
+    color: 'rgba(240, 248, 255, 0.85)',
+    fontSize: 13,
+    lineHeight: 18,
+    textShadowColor: 'rgba(0,0,0,0.35)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
+  dotsRow: {
     flexDirection: 'row',
-    gap: 12,
-    marginBottom: 24,
+    justifyContent: 'center',
+    marginTop: 10,
+    gap: 6,
   },
-  sectionHeader: {
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: 'rgba(255, 255, 255, 0.28)',
+  },
+  dotActive: {
+    backgroundColor: '#22D3EE',
+    width: 18,
+  },
+  sectionHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 12,
-  },
-  sectionTitle: {
-    color: '#F8FAFC',
-    fontSize: 22,
-    fontWeight: '700',
-  },
-  sectionLink: {
-    color: '#7DD3FC',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  footerPanel: {
-    backgroundColor: '#0F172A',
-    borderWidth: 1,
-    borderColor: '#1E293B',
-    borderRadius: 20,
-    padding: 18,
-    marginTop: 18,
-  },
-  footerTitle: {
-    color: '#E2E8F0',
-    fontSize: 16,
-    fontWeight: '700',
-    marginBottom: 10,
-  },
-  footerText: {
-    color: '#CBD5E1',
-    fontSize: 14,
-    lineHeight: 21,
-  },
-  footerMeta: {
-    color: '#A5F3FC',
-    fontSize: 12,
-    fontWeight: '600',
-    marginTop: 12,
-  },
-  filterRow: {
-    flexDirection: 'row',
-    gap: 8,
     marginBottom: 14,
   },
-  filter: {
-    borderWidth: 1,
-    borderColor: '#334155',
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-  },
-  filterSelected: {
-    backgroundColor: '#164E63',
-    borderColor: '#22D3EE',
-  },
-  filterText: {
-    color: '#94A3B8',
-    fontSize: 12,
+  sectionTitle: {
+    color: '#F0F8FF',
+    fontSize: 20,
     fontWeight: '700',
   },
-  filterTextSelected: {
-    color: '#ECFEFF',
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 14,
   },
-  emptyState: {
-    paddingVertical: 40,
+  gridItem: {
+    width: '48%',
+  },
+  gridArt: {
+    width: '100%',
+    height: 132,
+    borderRadius: 16,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+  },
+  gridKindChip: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(2, 8, 23, 0.55)',
+    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  gridKindText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
+  gridName: {
+    color: '#F0F8FF',
+    fontSize: 15,
+    fontWeight: '700',
+    marginTop: 10,
+    marginBottom: 2,
+  },
+  gridMeta: {
+    color: 'rgba(230, 240, 250, 0.6)',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  wrapper: {
+    flex: 1,
+  },
+  createFab: {
+    position: 'absolute',
+    right: 20,
+    bottom: 32,
+    width: 72,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: '#22D3EE',
+    justifyContent: 'center',
     alignItems: 'center',
+    shadowColor: '#22D3EE',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.45,
+    shadowRadius: 14,
+    elevation: 10,
+    zIndex: 20,
   },
-  emptyStateText: {
-    color: '#64748B',
-    fontSize: 14,
+  createFabText: {
+    color: '#052033',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.3,
     textAlign: 'center',
-    lineHeight: 22,
   },
   modalBackdrop: {
     flex: 1,
@@ -786,31 +1019,31 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(2, 8, 23, 0.72)',
   },
   modalPanel: {
-    backgroundColor: '#0F172A',
+    backgroundColor: '#0B1526',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 22,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: 'rgba(255, 255, 255, 0.16)',
   },
   modalTitle: {
-    color: '#F8FAFC',
+    color: '#F0F8FF',
     fontSize: 24,
     fontWeight: '800',
     marginBottom: 8,
   },
   modalSubtitle: {
-    color: '#CBD5E1',
+    color: 'rgba(240, 248, 255, 0.82)',
     fontSize: 14,
-    lineHeight: 20,
+    lineHeight: 21,
     marginBottom: 18,
   },
   input: {
-    backgroundColor: '#020617',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: 'rgba(255, 255, 255, 0.15)',
     borderRadius: 12,
-    color: '#F8FAFC',
+    color: '#F0F8FF',
     paddingHorizontal: 14,
     paddingVertical: 13,
     fontSize: 15,
@@ -825,13 +1058,13 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: 'rgba(255, 255, 255, 0.15)',
     borderRadius: 10,
     paddingVertical: 12,
   },
   kindButtonSelected: {
-    backgroundColor: '#334155',
-    borderColor: '#A5F3FC',
+    backgroundColor: 'rgba(34, 211, 238, 0.18)',
+    borderColor: '#22D3EE',
   },
   kindButtonDisabled: {
     opacity: 0.5,
@@ -861,7 +1094,7 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 220,
     borderRadius: 16,
-    backgroundColor: '#020617',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
     marginBottom: 18,
   },
   previewOrb: {
@@ -880,19 +1113,20 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   videoErrorHint: {
-    color: 'rgba(255,255,255,0.6)',
+    color: '#C7D2FE',
     fontSize: 11,
     fontWeight: '600',
     marginTop: 4,
   },
   destinationLabel: {
-    color: '#F8FAFC',
+    color: '#F0F8FF',
     fontSize: 13,
     fontWeight: '700',
+    letterSpacing: 0.2,
     marginBottom: 8,
   },
   previewOnlyLabel: {
-    color: '#A5F3FC',
+    color: '#E0FFFF',
     fontSize: 12,
     fontWeight: '700',
     marginBottom: 14,
@@ -920,7 +1154,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   durationLabel: {
-    color: '#A5F3FC',
+    color: '#E0FFFF',
     fontSize: 13,
     fontWeight: '700',
     marginTop: 14,
@@ -928,7 +1162,7 @@ const styles = StyleSheet.create({
   },
   sliderTrack: {
     height: 22,
-    backgroundColor: '#1E293B',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
     borderRadius: 11,
     justifyContent: 'center',
     marginBottom: 4,
@@ -946,6 +1180,50 @@ const styles = StyleSheet.create({
     backgroundColor: '#A5F3FC',
     borderWidth: 3,
     borderColor: '#083344',
+  },
+  rotationRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 14,
+  },
+  rotationButton: {
+    flex: 1,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    borderRadius: 10,
+    paddingVertical: 10,
+  },
+  rotationButtonSelected: {
+    backgroundColor: 'rgba(34, 211, 238, 0.18)',
+    borderColor: '#22D3EE',
+  },
+  rotationButtonText: {
+    color: '#E2E8F0',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  rotationHint: {
+    color: 'rgba(224, 255, 255, 0.75)',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  staticImagePreview: {
+    width: '100%',
+    height: 220,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    marginTop: 14,
+    marginBottom: 14,
+  },
+  staticHint: {
+    color: 'rgba(230, 240, 250, 0.65)',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 2,
+    marginBottom: 20,
+    lineHeight: 18,
   },
   errorText: {
     color: '#FDA4AF',
@@ -967,7 +1245,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
   },
   loadingText: {
-    color: '#A5F3FC',
+    color: '#E0FFFF',
     fontSize: 14,
     fontWeight: '700',
     marginTop: 14,
@@ -977,10 +1255,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
-    backgroundColor: '#020817',
+    backgroundColor: '#050E23',
   },
   errorBoundaryTitle: {
-    color: '#F8FAFC',
+    color: '#F0F8FF',
     fontSize: 24,
     fontWeight: '800',
     marginBottom: 12,

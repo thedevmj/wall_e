@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ActivityNotFoundException
+import android.graphics.BitmapFactory
 import android.net.Uri
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
@@ -20,47 +21,57 @@ import java.io.IOException
 
 class WallpaperModule(private val reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
     private var videoPromise: Promise? = null
+    private var imagePromise: Promise? = null
 
     init {
         reactContext.addActivityEventListener(object : com.facebook.react.bridge.BaseActivityEventListener() {
             override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
-                if (requestCode != VIDEO_REQUEST_CODE) return
-                val promise = videoPromise
-                videoPromise = null
-
-                if (promise == null) return
-
-                if (resultCode != Activity.RESULT_OK) {
-                    Log.w(TAG, "Video picker canceled: resultCode=$resultCode")
-                    promise.resolve(null)
-                    return
+                when (requestCode) {
+                    VIDEO_REQUEST_CODE -> handleVideoResult(resultCode, data)
+                    IMAGE_REQUEST_CODE -> handleImageResult(resultCode, data)
                 }
+            }
+        })
+    }
 
-                val uri = data?.data ?: data?.clipData?.getItemAt(0)?.uri
-                if (uri == null) {
-                    Log.e(TAG, "Video picker returned RESULT_OK without a URI")
-                    promise.resolve(null)
-                    return
-                }
+    private fun handleVideoResult(resultCode: Int, data: Intent?) {
+        val promise = videoPromise
+        videoPromise = null
 
+        if (promise == null) return
+
+        if (resultCode != Activity.RESULT_OK) {
+            Log.w(TAG, "Video picker canceled: resultCode=$resultCode")
+            promise.resolve(null)
+            return
+        }
+
+        val uri = data?.data ?: data?.clipData?.getItemAt(0)?.uri
+        if (uri == null) {
+            Log.e(TAG, "Video picker returned RESULT_OK without a URI")
+            promise.resolve(null)
+            return
+        }
+
+        try {
+            Log.i(TAG, "Video picked: uri=$uri scheme=${uri.scheme} authority=${uri.authority} flags=${data?.flags}")
+            if (uri.scheme == "content") {
                 try {
-                    Log.i(TAG, "Video picked: uri=$uri scheme=${uri.scheme} authority=${uri.authority} flags=${data?.flags}")
-                    // Keep the provider grant when available, then copy the bytes into app storage.
-                    if (uri.scheme == "content") {
-                        try {
-                            val grantedFlags = data?.flags?.and(
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                            ) ?: Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            reactContext.contentResolver.takePersistableUriPermission(
-                                uri,
-                                grantedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            )
-                            Log.i(TAG, "Persistable permission taken for: $uri")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Provider did not allow persistable permission for $uri", e)
-                        }
-                    }
+                    val grantedFlags = data?.flags?.and(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    ) ?: Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    reactContext.contentResolver.takePersistableUriPermission(
+                        uri,
+                        grantedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                    Log.i(TAG, "Persistable permission taken for: $uri")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Provider did not allow persistable permission for $uri", e)
+                }
+            }
 
+            Thread {
+                try {
                     val playableUri = copyVideoToAppStorage(uri)
                     Log.i(TAG, "Playable video URI: $playableUri")
                     val durationSeconds = extractVideoDuration(playableUri)
@@ -70,17 +81,96 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                         putString("uri", playableUri.toString())
                         putDouble("durationSeconds", durationSeconds.toDouble())
                     }
-                    promise.resolve(result)
+                    postToUi { promise.resolve(result) }
                 } catch (error: Exception) {
                     Log.e(TAG, "Failed to process picked video", error)
-                    promise.reject("VIDEO_READ_ERROR", "Unable to read the selected video: ${error.message}", error)
+                    postToUi {
+                        promise.reject(
+                            "VIDEO_READ_ERROR",
+                            "Unable to read the selected video: ${error.message}",
+                            error
+                        )
+                    }
+                }
+            }.start()
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to open picked video stream", error)
+            promise.reject("VIDEO_READ_ERROR", "Unable to read the selected video: ${error.message}", error)
+        }
+    }
+
+    private fun handleImageResult(resultCode: Int, data: Intent?) {
+        val promise = imagePromise
+        imagePromise = null
+
+        if (promise == null) return
+
+        if (resultCode != Activity.RESULT_OK) {
+            Log.w(TAG, "Image picker canceled: resultCode=$resultCode")
+            promise.resolve(null)
+            return
+        }
+
+        val uri = data?.data ?: data?.clipData?.getItemAt(0)?.uri
+        if (uri == null) {
+            Log.e(TAG, "Image picker returned RESULT_OK without a URI")
+            promise.resolve(null)
+            return
+        }
+
+        try {
+            Log.i(TAG, "Image picked: uri=$uri scheme=${uri.scheme} flags=${data?.flags}")
+            if (uri.scheme == "content") {
+                try {
+                    val grantedFlags = data?.flags?.and(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    ) ?: Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    reactContext.contentResolver.takePersistableUriPermission(
+                        uri,
+                        grantedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Provider did not allow persistable permission for $uri", e)
                 }
             }
-        })
+
+            Thread {
+                try {
+                    val copiedUri = copyImageToAppStorage(uri)
+                    Log.i(TAG, "Copied image URI: $copiedUri")
+
+                    val result: WritableMap = Arguments.createMap().apply {
+                        putString("uri", copiedUri.toString())
+                    }
+                    postToUi { promise.resolve(result) }
+                } catch (error: Exception) {
+                    Log.e(TAG, "Failed to process picked image", error)
+                    postToUi {
+                        promise.reject(
+                            "IMAGE_READ_ERROR",
+                            "Unable to read the selected image: ${error.message}",
+                            error
+                        )
+                    }
+                }
+            }.start()
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to open picked image stream", error)
+            promise.reject("IMAGE_READ_ERROR", "Unable to read the selected image: ${error.message}", error)
+        }
+    }
+
+    private fun postToUi(action: () -> Unit) {
+        try {
+            reactContext.runOnUiQueueThread { action() }
+        } catch (e: Exception) {
+            Log.w(TAG, "React context unavailable while resolving", e)
+        }
     }
 
     companion object {
         private const val VIDEO_REQUEST_CODE = 4107
+        private const val IMAGE_REQUEST_CODE = 4108
         private const val TAG = "WallpaperModule"
     }
 
@@ -95,6 +185,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             val featuresArray: WritableArray = Arguments.createArray().apply {
                 pushString("Doodle renderer")
                 pushString("Video preview")
+                pushString("Static image wallpaper")
+                pushString("Video rotation")
                 pushString("Wallpaper picker")
             }
 
@@ -114,6 +206,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 val fallbackFeatures: WritableArray = Arguments.createArray().apply {
                     pushString("Doodle renderer")
                     pushString("Video preview")
+                    pushString("Static image wallpaper")
+                    pushString("Video rotation")
                     pushString("Wallpaper picker")
                 }
                 putArray("features", fallbackFeatures)
@@ -123,11 +217,16 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     @ReactMethod
-    fun applyWallpaper(id: String, kind: String, destination: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, promise: Promise) {
+    fun applyWallpaper(id: String, kind: String, destination: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, rotation: Int, promise: Promise) {
         try {
-            Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio")
-            
-            saveWallpaperConfig(id, kind, videoUri, loop, playbackDuration, audio, "")
+            Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio, rotation=$rotation")
+
+            if (kind == "static") {
+                applyStaticWallpaper(id, videoUri, destination, promise)
+                return
+            }
+
+            saveWallpaperConfig(id, kind, videoUri, loop, playbackDuration, audio, "", rotation)
             val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
             val flags = when (destination.uppercase()) {
                 "HOME" -> WallpaperManager.FLAG_SYSTEM
@@ -157,6 +256,73 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         }
     }
 
+    private fun applyStaticWallpaper(id: String, imageUri: String, destination: String, promise: Promise) {
+        try {
+            if (imageUri.isBlank()) {
+                val result: WritableMap = Arguments.createMap().apply {
+                    putBoolean("ok", false)
+                    putString("id", id)
+                    putString("destination", destination)
+                    putString("error", "No image selected")
+                    putString("errorCode", "NO_IMAGE")
+                }
+                promise.resolve(result)
+                return
+            }
+
+            val uri = Uri.parse(imageUri)
+            val inputStream = reactContext.contentResolver.openInputStream(uri)
+                ?: reactContext.contentResolver.openInputStream(Uri.parse(imageUri.replace("file://", "")))
+                ?: throw IOException("Cannot open image URI: $imageUri")
+
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream.close()
+
+            if (bitmap == null) {
+                val result: WritableMap = Arguments.createMap().apply {
+                    putBoolean("ok", false)
+                    putString("id", id)
+                    putString("destination", destination)
+                    putString("error", "Could not decode the selected image")
+                    putString("errorCode", "IMAGE_DECODE_ERROR")
+                }
+                promise.resolve(result)
+                return
+            }
+
+            val wallpaperManager = WallpaperManager.getInstance(reactContext)
+            val flags = when (destination.uppercase()) {
+                "HOME" -> WallpaperManager.FLAG_SYSTEM
+                "LOCK" -> WallpaperManager.FLAG_LOCK
+                "BOTH" -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+                else -> WallpaperManager.FLAG_SYSTEM
+            }
+
+            wallpaperManager.setBitmap(bitmap, null, true, flags)
+            bitmap.recycle()
+
+            Log.i(TAG, "Static wallpaper applied: id=$id destination=$destination")
+
+            val result: WritableMap = Arguments.createMap().apply {
+                putBoolean("ok", true)
+                putString("id", id)
+                putString("destination", destination)
+                putString("mode", "static-wallpaper-$destination")
+            }
+            promise.resolve(result)
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to apply static wallpaper", error)
+            val result: WritableMap = Arguments.createMap().apply {
+                putBoolean("ok", false)
+                putString("id", id)
+                putString("destination", destination)
+                putString("error", "Unable to set the static wallpaper: ${error.message}")
+                putString("errorCode", "STATIC_APPLY_ERROR")
+            }
+            promise.resolve(result)
+        }
+    }
+
     @ReactMethod
     fun pickVideo(promise: Promise) {
         if (videoPromise != null) {
@@ -179,12 +345,34 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         }
     }
 
-    private fun saveWallpaperConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String) {
+    @ReactMethod
+    fun pickImage(promise: Promise) {
+        if (imagePromise != null) {
+            promise.reject("IMAGE_PICKER_BUSY", "An image picker is already open")
+            return
+        }
+        imagePromise = promise
+        Log.i(TAG, "Opening image picker: action=${Intent.ACTION_OPEN_DOCUMENT}")
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        try {
+            reactContext.startActivityForResult(intent, IMAGE_REQUEST_CODE, null)
+        } catch (error: Exception) {
+            imagePromise = null
+            Log.e(TAG, "Failed to open image picker", error)
+            promise.reject("IMAGE_PICKER_ERROR", "Unable to open image storage: ${error.message}", error)
+        }
+    }
+
+    private fun saveWallpaperConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String, rotation: Int = 0) {
         val preferences = reactContext.getSharedPreferences("wallpaper_pref", 0)
         val finalAccent = if (accent.isNotBlank()) accent else "#7C3AED"
-        
-        Log.i(TAG, "SAVING CONFIG TO SharedPreferences: kind=$kind, path=$videoUri")
-        
+
+        Log.i(TAG, "SAVING CONFIG TO SharedPreferences: kind=$kind, path=$videoUri, rotation=$rotation")
+
         preferences.edit()
             .putString("W_ID", id)
             .putString("W_KIND", kind)
@@ -193,6 +381,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             .putInt("W_DURATION", playbackDuration.coerceIn(1, 30))
             .putBoolean("W_AUDIO", audio)
             .putString("W_ACCENT", finalAccent)
+            .putInt("W_ROTATION", rotation.coerceIn(0, 270))
             .commit()
 
         val check = preferences.getString("W_PATH", "FAILED")
@@ -238,7 +427,24 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         }
     }
 
-    /** Return duration only when the URI exposes a real video track. */
+    private fun copyImageToAppStorage(uri: Uri): Uri {
+        val imageDirectory = File(reactContext.filesDir, "wallpapers").apply { mkdirs() }
+        val imageFile = File(imageDirectory, "image_${System.currentTimeMillis()}.jpg")
+        val input = reactContext.contentResolver.openInputStream(uri)
+            ?: throw IOException("Unable to open the selected image")
+
+        try {
+            input.use { source ->
+                imageFile.outputStream().use { destination -> source.copyTo(destination) }
+            }
+            Log.i(TAG, "Copied image to app storage: ${imageFile.absolutePath} size=${imageFile.length()}")
+            return Uri.fromFile(imageFile)
+        } catch (error: Exception) {
+            imageFile.delete()
+            throw IOException("Unable to copy the selected image into app storage", error)
+        }
+    }
+
     private fun extractVideoDuration(uri: Uri): Float? {
         var retriever: MediaMetadataRetriever? = null
         return try {

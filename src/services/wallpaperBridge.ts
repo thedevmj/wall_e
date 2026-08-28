@@ -1,5 +1,5 @@
 import { NativeModules } from 'react-native';
-import type { PickedVideo, WallpaperCapabilities, WallpaperApplyResult } from '../types';
+import type { PickedImage, PickedVideo, WallpaperCapabilities, WallpaperApplyResult } from '../types';
 
 const NATIVE_CALL_TIMEOUT_MS = 15000;
 
@@ -17,10 +17,15 @@ type NativeVideoResult = {
   durationSeconds?: unknown;
 };
 
+type NativeImageResult = {
+  uri?: unknown;
+};
+
 type NativeWallpaperModule = {
   getCapabilities?: () => Promise<unknown>;
   applyWallpaper?: (...args: unknown[]) => Promise<unknown>;
   pickVideo?: () => Promise<unknown>;
+  pickImage?: () => Promise<unknown>;
 };
 
 const fallbackCapabilities: WallpaperCapabilities = {
@@ -95,12 +100,13 @@ export const wallpaperBridge = {
 
   async applyWallpaper(
     id: string,
-    kind: 'doodle' | 'video',
+    kind: 'doodle' | 'video' | 'static',
     destination: 'HOME' | 'LOCK' | 'BOTH',
     videoUri?: string,
     loop = true,
     playbackDuration = 30,
     audio = false,
+    rotation = 0,
   ): Promise<WallpaperApplyResult> {
     try {
       console.log('[WallpaperBridge] applyWallpaper request', {
@@ -111,11 +117,12 @@ export const wallpaperBridge = {
         loop,
         playbackDuration,
         audio,
+        rotation,
       });
       const nativeModule = getNativeModule();
       if (nativeModule && typeof nativeModule.applyWallpaper === 'function') {
         const result = await withTimeout(
-          nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio),
+          nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio, rotation),
           NATIVE_CALL_TIMEOUT_MS,
           'applyWallpaper',
         );
@@ -176,6 +183,39 @@ export const wallpaperBridge = {
       };
     } catch (error) {
       console.warn('Video picker failed', error);
+      throw error; // Re-throw so caller can show specific error
+    }
+  },
+
+  async pickImage(): Promise<PickedImage | null> {
+    try {
+      console.log('[WallpaperBridge] pickImage request');
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.pickImage !== 'function') {
+        return null;
+      }
+      const result = await withTimeout(
+        nativeModule.pickImage(),
+        60000, // image picking can take a while — 60s timeout
+        'pickImage',
+      );
+      console.log('[WallpaperBridge] pickImage response', result);
+      if (!result) {
+        return null;
+      }
+      if (typeof result === 'string') {
+        return { uri: result };
+      }
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const image = result as NativeImageResult;
+      if (typeof image.uri !== 'string' || !image.uri) {
+        return null;
+      }
+      return { uri: image.uri };
+    } catch (error) {
+      console.warn('Image picker failed', error);
       throw error; // Re-throw so caller can show specific error
     }
   },

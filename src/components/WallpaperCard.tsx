@@ -57,7 +57,9 @@ const styles = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#111827',
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderWidth: 1,
     borderRadius: 18,
     borderLeftWidth: 5,
     marginBottom: 14,
@@ -81,12 +83,15 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   title: {
-    color: '#F8FAFC',
+    color: '#FFFFFF',
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: {width: 0, height: 1},
+    textShadowRadius: 4,
     fontSize: 18,
     fontWeight: '700',
   },
   description: {
-    color: '#CBD5E1',
+    color: '#E2E8F0',
     fontSize: 13,
     lineHeight: 18,
   },
@@ -96,13 +101,13 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   meta: {
-    color: '#94A3B8',
+    color: '#B0BEC5',
     fontSize: 11,
     fontWeight: '600',
     letterSpacing: 0.8,
   },
   status: {
-    color: '#A5F3FC',
+    color: '#E0FFFF',
     fontSize: 11,
     fontWeight: '700',
     marginLeft: 8,
@@ -113,7 +118,7 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
   },
   deleteText: {
-    color: '#FDA4AF',
+    color: '#FFC2C2',
     fontSize: 11,
     fontWeight: '800',
   },

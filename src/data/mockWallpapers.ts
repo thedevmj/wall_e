@@ -32,3 +32,46 @@ export const mockWallpapers: Wallpaper[] = [
     createdAt: '4 days ago',
   },
 ];
+
+export const predefinedWallpapers: Wallpaper[] = [
+  {
+    id: 'pre-aurora',
+    title: 'Aurora Drift',
+    kind: 'doodle',
+    description: 'Glowing motion loops with soft oscillating strokes.',
+    accent: '#7C3AED',
+    status: 'Ready',
+    duration: '18 sec',
+    createdAt: 'Featured',
+  },
+  {
+    id: 'pre-sunset',
+    title: 'Sunset Pulse',
+    kind: 'doodle',
+    description: 'Warm pulses that breathe slowly over a sunset palette.',
+    accent: '#F97316',
+    status: 'Ready',
+    duration: '25 sec',
+    createdAt: 'Featured',
+  },
+  {
+    id: 'pre-spark',
+    title: 'Spark Bloom',
+    kind: 'doodle',
+    description: 'Particle fields with layered gradients and slow fades.',
+    accent: '#10B981',
+    status: 'Ready',
+    duration: '12 sec',
+    createdAt: 'Featured',
+  },
+  {
+    id: 'pre-ocean',
+    title: 'Midnight Ocean',
+    kind: 'doodle',
+    description: 'Deep blue wave motion loops for relaxing screens.',
+    accent: '#0891B2',
+    status: 'Ready',
+    duration: '30 sec',
+    createdAt: 'Featured',
+  },
+];

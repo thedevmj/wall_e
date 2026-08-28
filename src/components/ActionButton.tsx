@@ -42,10 +42,18 @@ const styles = StyleSheet.create({
     minWidth: 160,
   },
   primary: {
-    backgroundColor: '#7C3AED',
+    backgroundColor: 'rgba(124, 58, 237, 0.82)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+    shadowColor: '#7C3AED',
+    shadowOffset: {width: 0, height: 3},
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
   },
   secondary: {
-    backgroundColor: '#1F2937',
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
   },
   pressed: {
     opacity: 0.85,

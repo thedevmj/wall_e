@@ -15,6 +15,8 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.bridge.WritableArray
 import java.io.File
+import java.io.InputStream
+import java.net.URL
 import android.media.MediaMetadataRetriever
 import android.util.Log
 import java.io.IOException
@@ -226,7 +228,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
-            saveWallpaperConfig(id, kind, videoUri, loop, playbackDuration, audio, "", rotation)
+            val mediaUri = resolveMediaUri(videoUri, "bundled_video", "mp4")
+            saveWallpaperConfig(id, kind, mediaUri.toString(), loop, playbackDuration, audio, "", rotation)
             val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
             val flags = when (destination.uppercase()) {
                 "HOME" -> WallpaperManager.FLAG_SYSTEM
@@ -270,10 +273,14 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
-            val uri = Uri.parse(imageUri)
+            val uri = resolveMediaUri(imageUri, "bundled_image", "jpg")
             val inputStream = reactContext.contentResolver.openInputStream(uri)
-                ?: reactContext.contentResolver.openInputStream(Uri.parse(imageUri.replace("file://", "")))
-                ?: throw IOException("Cannot open image URI: $imageUri")
+                ?: if (uri.scheme?.equals("file", true) == true) {
+                    uri.path?.let { File(it).inputStream() }
+                } else {
+                    null
+                }
+                ?: throw IOException("Cannot open image URI: $uri")
 
             val bitmap = BitmapFactory.decodeStream(inputStream)
             inputStream.close()
@@ -364,6 +371,88 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             imagePromise = null
             Log.e(TAG, "Failed to open image picker", error)
             promise.reject("IMAGE_PICKER_ERROR", "Unable to open image storage: ${error.message}", error)
+        }
+    }
+
+    @ReactMethod
+    fun prepareBundledMedia(source: String, kind: String, promise: Promise) {
+        Thread {
+            try {
+                if (source.isBlank()) throw IllegalArgumentException("Missing media source")
+                Log.i(TAG, "prepareBundledMedia: source=$source kind=$kind")
+                val prefix = if (kind == "video") "bundled_video" else "bundled_image"
+                val ext = if (kind == "video") "mp4" else "jpg"
+                val parsed = Uri.parse(source)
+                val resolved: Uri = when (parsed.scheme?.lowercase()) {
+                    "http", "https" -> copyRemoteToAppStorage(source, prefix, ext)
+                    else -> resolveMediaUri(source, prefix, ext)
+                }
+                Log.i(TAG, "prepareBundledMedia resolved to: $resolved")
+                val result: WritableMap = Arguments.createMap().apply {
+                    putString("uri", resolved.toString())
+                }
+                postToUi { promise.resolve(result) }
+            } catch (error: Exception) {
+                Log.e(TAG, "prepareBundledMedia failed", error)
+                postToUi {
+                    promise.reject(
+                        "BUNDLED_PREPARE_ERROR",
+                        "Unable to prepare embedded media: ${error.message}",
+                        error
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun resolveMediaUri(rawUri: String, prefix: String, ext: String): Uri {
+        if (rawUri.isBlank()) throw IllegalArgumentException("Missing media URI")
+        val parsed = Uri.parse(rawUri)
+        return when (parsed.scheme?.lowercase()) {
+            "content", "file" -> parsed
+            "http", "https" -> copyRemoteToAppStorage(rawUri, prefix, ext)
+            else -> copyBundledResourceToAppStorage(rawUri, prefix, ext)
+        }
+    }
+
+    private fun copyBundledResourceToAppStorage(identifier: String, prefix: String, ext: String): Uri {
+        val name = identifier.substringAfterLast('/').substringBefore('?')
+        if (name.isBlank()) throw IOException("Bundled asset identifier is empty: $identifier")
+        var resId = reactContext.resources.getIdentifier(name, "raw", reactContext.packageName)
+        if (resId == 0) {
+            resId = reactContext.resources.getIdentifier(name, "drawable", reactContext.packageName)
+        }
+        if (resId == 0) {
+            throw IOException("Bundled asset not found in app resources: $name")
+        }
+        val input = reactContext.resources.openRawResource(resId)
+            ?: throw IOException("Unable to open bundled asset resource: $name")
+        Log.i(TAG, "Bundled asset [$name] -> resId=$resId")
+        return copyStreamToAppStorage(input, prefix, ext, name)
+    }
+
+    private fun copyRemoteToAppStorage(url: String, prefix: String, ext: String): Uri {
+        val connection = URL(url).openConnection()
+        connection.connectTimeout = 20000
+        connection.readTimeout = 60000
+        connection.setRequestProperty("Accept-Encoding", "identity")
+        val input = connection.getInputStream()
+        Log.i(TAG, "Downloading remote bundled asset: $url")
+        return copyStreamToAppStorage(input, prefix, ext, url.substringAfterLast('/'))
+    }
+
+    private fun copyStreamToAppStorage(input: InputStream, prefix: String, ext: String, label: String): Uri {
+        val file = File(File(reactContext.filesDir, "wallpapers").apply { mkdirs() }, "${prefix}_${System.currentTimeMillis()}.${ext.ifBlank { "mp4" }}")
+        return try {
+            input.use { source ->
+                file.outputStream().use { destination -> source.copyTo(destination) }
+            }
+            Log.i(TAG, "Prepared bundled media [$label] -> ${file.absolutePath} bytes=${file.length()} readable=${file.canRead()}")
+            if (file.length() <= 0L) throw IOException("Prepared bundled media file is empty")
+            Uri.fromFile(file)
+        } catch (error: Exception) {
+            file.delete()
+            throw IOException("Unable to prepare bundled media [$label]", error)
         }
     }
 

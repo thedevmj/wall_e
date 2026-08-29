@@ -14,14 +14,14 @@ import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.Choreographer
 import android.view.SurfaceHolder
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.Player
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
-import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import java.io.File
 import kotlin.math.sin
 
@@ -78,6 +78,12 @@ class LiveWallpaperService : WallpaperService() {
         private var videoErrorMessage = ""
         private var isPlayerReady = false
         private var enforceDurationRunnable: Runnable? = null
+        private var videoGlRenderer: VideoGlRenderer? = null
+        private var glFallbackTriggered = false
+        private var glFirstFrameSeen = false
+        private var glEndedPending = false
+        private var glEndedFrames = 0
+        private var glReadyAt = 0L
         private var frameFallbackRetriever: MediaMetadataRetriever? = null
         private var frameFallbackDurationUs = 0L
         private var frameFallbackBitmap: android.graphics.Bitmap? = null
@@ -86,6 +92,7 @@ class LiveWallpaperService : WallpaperService() {
         private val frameFallbackIntervalMs = 33L
         private var frameFallbackRunning = false
         private var staticBitmap: android.graphics.Bitmap? = null
+        private var frameFallbackFailures = 0
 
         private val decodeFallbackFrame = object : Runnable {
             override fun run() {
@@ -104,13 +111,26 @@ class LiveWallpaperService : WallpaperService() {
                     if (bitmap != null) {
                         synchronized(frameLock) {
                             val previousBitmap = frameFallbackBitmap
-                            frameFallbackBitmap = bitmap
+                            frameFallbackBitmap = downscaleFallbackBitmap(bitmap)
                             previousBitmap?.recycle()
+                            if (frameFallbackBitmap != bitmap) bitmap.recycle()
                         }
+                        frameFallbackFailures = 0
                     }
                     frameFallbackFinished = !shouldLoop && elapsedUs >= durationUs
                 } catch (error: Exception) {
                     Log.e(TAG, "Frame fallback decode failed at ${positionUs}us", error)
+                    frameFallbackFailures++
+                    if (frameFallbackFailures >= 6) {
+                        Log.e(TAG, "Frame fallback failed repeatedly; marking video as failed")
+                        synchronized(playerLock) {
+                            videoFailed = true
+                            videoErrorMessage = "This device cannot play the selected video format"
+                        }
+                        releaseFrameFallback()
+                        mainHandler.post { refreshRendering() }
+                        return
+                    }
                 }
 
                 if (frameFallbackRunning && frameFallbackRetriever != null && (!frameFallbackFinished || frameFallbackBitmap != null)) {
@@ -147,7 +167,8 @@ class LiveWallpaperService : WallpaperService() {
             Log.i(TAG, "ON_SURFACE_CHANGED: ${width}x${height}, format=$format")
             if (wallpaperKind == "video") {
                 synchronized(playerLock) {
-                    exoPlayer?.setVideoSurface(holder.surface)
+                    videoGlRenderer?.updateSurfaceSize(width, height)
+                    if (videoGlRenderer == null) exoPlayer?.setVideoSurface(holder.surface)
                 }
             } else if (wallpaperKind == "static") {
                 // Orientation/size changes need a fresh paint of the still image.
@@ -268,6 +289,34 @@ class LiveWallpaperService : WallpaperService() {
                 return
             }
 
+            // Rotated videos render through a GPU texture pipeline so playback
+            // stays smooth and lossless at any angle. If the GL renderer cannot
+            // start we fall back to the centered canvas path.
+            val isRotated = videoRotationDegrees % 360 != 0
+            if (isRotated) {
+                videoGlRenderer = try {
+                    VideoGlRenderer(
+                        holder.surface,
+                        holder.surfaceFrame.width().coerceAtLeast(1),
+                        holder.surfaceFrame.height().coerceAtLeast(1),
+                        videoRotationDegrees,
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "GL renderer init failed; using frame fallback", e)
+                    videoGlRenderer?.release()
+                    videoGlRenderer = null
+                    null
+                }
+                if (videoGlRenderer == null) {
+                    startFrameFallback(videoUri)
+                    return
+                }
+                glFallbackTriggered = false
+                glFirstFrameSeen = false
+                glReadyAt = 0L
+                Log.i(TAG, "Rotated video: rendering via GPU pipeline (rotation=$videoRotationDegrees)")
+            }
+
             Log.i(TAG, "STARTING EXOPLAYER FOR: $videoUri")
             logVideoMetadata(videoUri)
 
@@ -277,26 +326,15 @@ class LiveWallpaperService : WallpaperService() {
                 videoErrorMessage = ""
                 isPlayerReady = false
 
+                // Use the default (hardware-first) codec order with automatic
+                // fallback so playable videos decode fast and smooth.
                 val renderersFactory = DefaultRenderersFactory(this@LiveWallpaperService)
                     .setEnableDecoderFallback(true)
-                    .setMediaCodecSelector(MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
-                        val decoderInfos = MediaCodecSelector.DEFAULT.getDecoderInfos(
-                            mimeType,
-                            requiresSecureDecoder,
-                            requiresTunnelingDecoder,
-                        )
-                        if (mimeType == MimeTypes.VIDEO_H264) {
-                            val softwareDecoders = decoderInfos.filter { it.softwareOnly }
-                            Log.i(TAG, "H.264 decoder candidates: all=${decoderInfos.map { it.name }} software=${softwareDecoders.map { it.name }}")
-                            if (softwareDecoders.isNotEmpty()) softwareDecoders else decoderInfos
-                        } else {
-                            decoderInfos
-                        }
-                    })
-                Log.i(TAG, "Creating ExoPlayer with decoder fallback enabled")
+                Log.i(TAG, "Creating ExoPlayer with hardware-first decoders and fallback enabled")
                 exoPlayer = ExoPlayer.Builder(this@LiveWallpaperService, renderersFactory).build().apply {
                     Log.i(TAG, "ExoPlayer created: applicationContext=${this@LiveWallpaperService.applicationContext.packageName}")
-                    setVideoSurface(holder.surface)
+                    setVideoSurface(videoGlRenderer?.videoSurfaceForPlayer() ?: holder.surface)
+                    videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
                     repeatMode = if (shouldLoop) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
                     volume = if (includeAudio) 1f else 0f
                     
@@ -306,8 +344,19 @@ class LiveWallpaperService : WallpaperService() {
                             if (state == Player.STATE_READY) {
                                 isPlayerReady = true
                                 videoFailed = false
+                                if (videoGlRenderer != null && glReadyAt == 0L) {
+                                    glReadyAt = System.currentTimeMillis()
+                                }
                                 refreshRendering()
+                            } else if (state == Player.STATE_ENDED && videoGlRenderer != null && !shouldLoop) {
+                                glEndedFrames = videoGlRenderer?.framesRendered ?: 0
+                                glEndedPending = true
                             }
+                        }
+
+                        override fun onVideoSizeChanged(videoSize: VideoSize) {
+                            videoGlRenderer?.setVideoSize(videoSize.width, videoSize.height)
+                            Log.i(TAG, "VIDEO SIZE = ${videoSize.width}x${videoSize.height}")
                         }
 
                         override fun onPlayerError(error: PlaybackException) {
@@ -328,6 +377,7 @@ class LiveWallpaperService : WallpaperService() {
                             
                             videoFailed = true
                             videoErrorMessage = "Playback error: ${error.errorCodeName}"
+                            releaseGlRenderer()
                             startFrameFallback(videoUri)
                             mainHandler.post { refreshRendering() }
                         }
@@ -339,18 +389,20 @@ class LiveWallpaperService : WallpaperService() {
                     prepare()
                     play()
 
-                    // Enforce playback duration (W_DURATION) for both loop and one-shot.
+                    // Enforce the preview duration (W_DURATION). Loop mode rewinds
+                    // to 0; one-shot mode holds the final frame without re-seeking.
                     val durationMs = playbackDuration * 1000L
                     mainHandler.removeCallbacks(enforceDurationRunnable ?: Runnable {})
                     enforceDurationRunnable = object : Runnable {
                         override fun run() {
                             synchronized(playerLock) {
-                                val pos = exoPlayer?.currentPosition ?: 0
+                                val player = exoPlayer
+                                val pos = player?.currentPosition ?: 0
                                 if (pos >= durationMs) {
                                     if (shouldLoop) {
-                                        exoPlayer?.seekTo(0L)
-                                    } else {
-                                        exoPlayer?.seekTo(durationMs.coerceAtMost(durationMs))
+                                        player?.seekTo(0L)
+                                    } else if (player?.playbackState != Player.STATE_ENDED) {
+                                        player?.seekTo(durationMs)
                                     }
                                 }
                             }
@@ -371,10 +423,58 @@ class LiveWallpaperService : WallpaperService() {
         private fun releaseExoPlayerLocked() {
             mainHandler.removeCallbacks(enforceDurationRunnable ?: Runnable {})
             enforceDurationRunnable = null
+            releaseGlRenderer()
             exoPlayer?.stop()
             exoPlayer?.release()
             exoPlayer = null
             isPlayerReady = false
+        }
+
+        private fun releaseGlRenderer() {
+            try {
+                videoGlRenderer?.release()
+            } catch (_: Exception) {
+                // best-effort GL teardown
+            }
+            videoGlRenderer = null
+            glFallbackTriggered = false
+            glFirstFrameSeen = false
+            glEndedPending = false
+            glEndedFrames = 0
+            glReadyAt = 0L
+        }
+
+        private fun switchGlToFallback() {
+            if (glFallbackTriggered) return
+            glFallbackTriggered = true
+            Log.w(TAG, "GPU video pipeline unavailable; switching to frame fallback")
+            synchronized(playerLock) {
+                releaseExoPlayerLocked()
+            }
+            val videoUri = try {
+                Uri.parse(configuredVideoUriString)
+            } catch (e: Exception) {
+                null
+            }
+            if (videoUri != null) {
+                frameFallbackFailures = 0
+                startFrameFallback(videoUri)
+            }
+            mainHandler.post { refreshRendering() }
+        }
+
+        private fun checkGlWatchdog() {
+            if (glFallbackTriggered || glFirstFrameSeen) return
+            val renderer = videoGlRenderer ?: return
+            if (renderer.hasError) {
+                switchGlToFallback()
+                return
+            }
+            if (!isPlayerReady || glReadyAt == 0L) return
+            if (System.currentTimeMillis() - glReadyAt > 3500L) {
+                Log.w(TAG, "GPU pipeline produced no frames within 3.5s; switching to frame fallback")
+                switchGlToFallback()
+            }
         }
 
         private fun startFrameFallback(videoUri: Uri) {
@@ -423,6 +523,15 @@ class LiveWallpaperService : WallpaperService() {
             frameFallbackFinished = false
         }
 
+        private fun downscaleFallbackBitmap(source: android.graphics.Bitmap): android.graphics.Bitmap {
+            val maxWidth = 480
+            if (source.width <= maxWidth) return source
+            val scale = maxWidth.toFloat() / source.width
+            val w = (source.width * scale).toInt()
+            val h = (source.height * scale).toInt()
+            return android.graphics.Bitmap.createScaledBitmap(source, w, h, true)
+        }
+
         private fun renderFrameFallback(canvas: Canvas): Boolean {
             synchronized(frameLock) {
                 val bitmap = frameFallbackBitmap ?: return false
@@ -451,38 +560,33 @@ class LiveWallpaperService : WallpaperService() {
             canvas.drawColor(Color.BLACK)
             val source = android.graphics.Rect(0, 0, bitmap.width, bitmap.height)
 
+            // The rotated footprint of the content on screen.
+            val rotatedWidth: Float
+            val rotatedHeight: Float
             if (videoRotationDegrees == 90 || videoRotationDegrees == 270) {
-                val scaleX = canvasWidth.toFloat() / bitmap.height
-                val scaleY = canvasHeight.toFloat() / bitmap.width
-                val scale = minOf(scaleX, scaleY)
-                val drawWidth = bitmap.height * scale
-                val drawHeight = bitmap.width * scale
-                val left = (canvasWidth - drawWidth) / 2f
-                val top = (canvasHeight - drawHeight) / 2f
-                val destination = android.graphics.Rect(
-                    left.toInt(),
-                    top.toInt(),
-                    (left + drawWidth).toInt(),
-                    (top + drawHeight).toInt(),
-                )
-                canvas.drawBitmap(bitmap, source, destination, videoPaint)
+                rotatedWidth = bitmap.height.toFloat()
+                rotatedHeight = bitmap.width.toFloat()
             } else {
-                val scaleX = canvasWidth.toFloat() / bitmap.width
-                val scaleY = canvasHeight.toFloat() / bitmap.height
-                val scale = minOf(scaleX, scaleY)
-                val drawWidth = bitmap.width * scale
-                val drawHeight = bitmap.height * scale
-                val left = (canvasWidth - drawWidth) / 2f
-                val top = (canvasHeight - drawHeight) / 2f
-                val destination = android.graphics.Rect(
-                    left.toInt(),
-                    top.toInt(),
-                    (left + drawWidth).toInt(),
-                    (top + drawHeight).toInt(),
-                )
-                canvas.drawBitmap(bitmap, source, destination, videoPaint)
+                rotatedWidth = bitmap.width.toFloat()
+                rotatedHeight = bitmap.height.toFloat()
             }
 
+            // Cover: stretch to fill the whole screen and center (crop the overflow).
+            val scaleX = canvasWidth.toFloat() / rotatedWidth
+            val scaleY = canvasHeight.toFloat() / rotatedHeight
+            val scale = maxOf(scaleX, scaleY)
+            val drawWidth = rotatedWidth * scale
+            val drawHeight = rotatedHeight * scale
+            val left = (canvasWidth - drawWidth) / 2f
+            val top = (canvasHeight - drawHeight) / 2f
+            val destination = android.graphics.Rect(
+                left.toInt(),
+                top.toInt(),
+                (left + drawWidth).toInt(),
+                (top + drawHeight).toInt(),
+            )
+
+            canvas.drawBitmap(bitmap, source, destination, videoPaint)
             canvas.restoreToCount(saveCount)
         }
 
@@ -509,6 +613,7 @@ class LiveWallpaperService : WallpaperService() {
             synchronized(playerLock) {
                 val videoOwnsSurface =
                     wallpaperKind == "video" &&
+                        videoRotationDegrees % 360 == 0 &&
                         exoPlayer != null &&
                         isPlayerReady &&
                         !videoFailed &&
@@ -525,34 +630,63 @@ class LiveWallpaperService : WallpaperService() {
             if (!isRendering) return
             val holder = surfaceHolder ?: return
 
-            val isVideoActive = synchronized(playerLock) {
-                wallpaperKind == "video" && exoPlayer != null && !videoFailed
+            val glActive = synchronized(playerLock) {
+                wallpaperKind == "video" &&
+                    videoRotationDegrees % 360 != 0 &&
+                    videoGlRenderer != null &&
+                    exoPlayer != null &&
+                    !videoFailed &&
+                    isPlayerReady
             }
-            val videoFullyReady = isVideoActive && isPlayerReady && !videoFailed
 
-            val drawWithCanvas = synchronized(playerLock) {
-                wallpaperKind == "static" || (wallpaperKind == "video" && videoFailed)
-            }
-
-            if (drawWithCanvas) {
-                var canvas: Canvas? = null
-                try {
-                    canvas = holder.lockCanvas()
-                    if (canvas != null) {
-                        drawFrame(canvas)
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Render frame error", e)
-                } finally {
-                    canvas?.let {
-                        try { holder.unlockCanvasAndPost(it) } catch (_: Exception) {}
+            if (glActive) {
+                videoGlRenderer?.let { renderer ->
+                    if (renderer.hasError) {
+                        switchGlToFallback()
+                    } else {
+                        renderer.render()
+                        if (renderer.framesRendered > 0 && !glFirstFrameSeen) {
+                            glFirstFrameSeen = true
+                            Log.i(TAG, "GPU pipeline producing frames")
+                        }
+                        checkGlWatchdog()
+                        if (glEndedPending && renderer.framesRendered > glEndedFrames) {
+                            glEndedPending = false
+                            stopRendering()
+                        }
                     }
                 }
+            } else {
+                val drawWithCanvas = synchronized(playerLock) {
+                    wallpaperKind == "static" ||
+                        (wallpaperKind == "video" && videoGlRenderer == null && (videoFailed || videoRotationDegrees % 360 != 0))
+                }
 
-                if (wallpaperKind == "static") {
-                    // A still image only needs a single paint; stop the loop to save battery.
-                    stopRendering()
-                    return
+                if (drawWithCanvas) {
+                    var canvas: Canvas? = null
+                    try {
+                        canvas = holder.lockCanvas()
+                        if (canvas != null) {
+                            drawFrame(canvas)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Render frame error", e)
+                    } finally {
+                        canvas?.let {
+                            try { holder.unlockCanvasAndPost(it) } catch (_: Exception) {}
+                        }
+                    }
+
+                    if (wallpaperKind == "static") {
+                        // A still image only needs a single paint; stop the loop to save battery.
+                        stopRendering()
+                        return
+                    }
+                    if (!shouldLoop && frameFallbackFinished) {
+                        // One-shot canvas playback: hold the final frame, stop the loop.
+                        stopRendering()
+                        return
+                    }
                 }
             }
 

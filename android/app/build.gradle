@@ -94,11 +94,11 @@ android {
 
     configurations.all {
         resolutionStrategy {
-            force "androidx.media3:media3-exoplayer:1.5.1"
-            force "androidx.media3:media3-ui:1.5.1"
-            force "androidx.media3:media3-common:1.5.1"
-            force "androidx.media3:media3-exoplayer-rtsp:1.5.1"
-            force "androidx.media3:media3-exoplayer-dash:1.5.1"
+            // Keep media3 aligned with the version react-native-video ships
+            // (RNVideo_media3Version=1.8.0) to avoid duplicate classes when the
+            // release build merges dex.
+            force "androidx.media3:media3-exoplayer:1.8.0"
+            force "androidx.media3:media3-common:1.8.0"
         }
     }
 
@@ -128,14 +128,11 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
-    // Media3 Core and UI
-    implementation("androidx.media3:media3-exoplayer:1.5.1")
-    implementation("androidx.media3:media3-ui:1.5.1")
-    implementation("androidx.media3:media3-common:1.5.1")
-    
-    // Media3 Extensions for high-profile 4K and various MP4 containers
-    implementation("androidx.media3:media3-exoplayer-rtsp:1.5.1")
-    implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
+    // Media3 used by WallpaperService for live wallpaper playback.
+    // Keep aligned with the version react-native-video ships (1.8.0) so the
+    // release build doesn't end up with duplicated androidx.media3 classes.
+    implementation("androidx.media3:media3-exoplayer:1.8.0")
+    implementation("androidx.media3:media3-common:1.8.0")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

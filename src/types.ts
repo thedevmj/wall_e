@@ -1,3 +1,5 @@
+import type { ImageSourcePropType } from 'react-native';
+
 export type WallpaperKind = 'doodle' | 'video' | 'static';
 
 export type Wallpaper = {
@@ -9,6 +11,8 @@ export type Wallpaper = {
   status: 'Ready' | 'Needs preview' | 'Applied';
   duration: string;
   createdAt: string;
+  source?: ImageSourcePropType;
+  poster?: ImageSourcePropType;
   videoUri?: string;
   imageUri?: string;
   loop?: boolean;

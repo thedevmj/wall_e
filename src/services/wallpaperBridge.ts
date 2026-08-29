@@ -26,6 +26,7 @@ type NativeWallpaperModule = {
   applyWallpaper?: (...args: unknown[]) => Promise<unknown>;
   pickVideo?: () => Promise<unknown>;
   pickImage?: () => Promise<unknown>;
+  prepareBundledMedia?: (source: string, kind: string) => Promise<unknown>;
 };
 
 const fallbackCapabilities: WallpaperCapabilities = {
@@ -217,6 +218,40 @@ export const wallpaperBridge = {
     } catch (error) {
       console.warn('Image picker failed', error);
       throw error; // Re-throw so caller can show specific error
+    }
+  },
+
+  /**
+   * Resolves an embedded (bundled) media source to a playable local file URI.
+   * Works for both dev-mode Metro URLs and release-mode resource identifiers.
+   */
+  async prepareBundledMedia(source: string, kind: 'video' | 'static'): Promise<string | null> {
+    try {
+      console.log('[WallpaperBridge] prepareBundledMedia request', { source, kind });
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.prepareBundledMedia !== 'function') {
+        return null;
+      }
+      const result = await withTimeout(
+        nativeModule.prepareBundledMedia(source, kind),
+        60000, // may need to copy a large embedded file — 60s timeout
+        'prepareBundledMedia',
+      );
+      console.log('[WallpaperBridge] prepareBundledMedia response', result);
+      if (!result) {
+        return null;
+      }
+      if (typeof result === 'string') {
+        return result;
+      }
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const prepared = result as { uri?: unknown };
+      return asString(prepared.uri) ?? null;
+    } catch (error) {
+      console.warn('Embedded media preparation failed', error);
+      return null;
     }
   },
 

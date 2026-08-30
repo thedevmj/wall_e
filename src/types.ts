@@ -32,9 +32,13 @@ export type PickedImage = {
 
 export type WallpaperCapabilities = {
   supportsLiveWallpaper: boolean;
+  setWallpaperAllowed: boolean;
+  liveWallpaperPickerAvailable: boolean;
   minSdk: number;
   targetSdk: number;
   features: string[];
+  device?: string;
+  androidVersion?: string;
 };
 
 export type WallpaperApplyResult = {

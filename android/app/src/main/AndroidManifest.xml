@@ -12,6 +12,9 @@
             <action android:name="android.service.wallpaper.WallpaperService" />
         </intent>
         <intent>
+            <action android:name="android.service.wallpaper.CHANGE_LIVE_WALLPAPER" />
+        </intent>
+        <intent>
             <action android:name="android.intent.action.SET_WALLPAPER" />
         </intent>
     </queries>

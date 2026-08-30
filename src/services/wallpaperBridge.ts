@@ -27,13 +27,16 @@ type NativeWallpaperModule = {
   pickVideo?: () => Promise<unknown>;
   pickImage?: () => Promise<unknown>;
   prepareBundledMedia?: (source: string, kind: string) => Promise<unknown>;
+  copyToClipboard?: (text: string) => void;
 };
 
 const fallbackCapabilities: WallpaperCapabilities = {
   supportsLiveWallpaper: false,
+  setWallpaperAllowed: true,
+  liveWallpaperPickerAvailable: false,
   minSdk: 24,
   targetSdk: 36,
-  features: ['Doodle renderer', 'Video preview', 'Wallpaper picker'],
+  features: ['Doodle renderer', 'Video preview', 'Static image wallpaper', 'Wallpaper picker'],
 };
 
 /**
@@ -78,17 +81,28 @@ export const wallpaperBridge = {
         if (result && typeof result === 'object' && !Array.isArray(result)) {
           const capabilities = result as {
             supportsLiveWallpaper?: unknown;
+            setWallpaperAllowed?: unknown;
+            liveWallpaperPickerAvailable?: unknown;
             minSdk?: unknown;
             targetSdk?: unknown;
             features?: unknown;
+            device?: unknown;
+            androidVersion?: unknown;
           };
           return {
             supportsLiveWallpaper: capabilities.supportsLiveWallpaper === true,
+            setWallpaperAllowed: capabilities.setWallpaperAllowed !== false,
+            liveWallpaperPickerAvailable:
+              capabilities.liveWallpaperPickerAvailable === true ||
+              (capabilities.liveWallpaperPickerAvailable == null &&
+                capabilities.supportsLiveWallpaper === true),
             minSdk: Number.isFinite(Number(capabilities.minSdk)) ? Number(capabilities.minSdk) : 24,
             targetSdk: Number.isFinite(Number(capabilities.targetSdk)) ? Number(capabilities.targetSdk) : 36,
             features: Array.isArray(capabilities.features)
               ? capabilities.features.filter((feature): feature is string => typeof feature === 'string')
               : [...fallbackCapabilities.features],
+            device: asString(capabilities.device),
+            androidVersion: asString(capabilities.androidVersion),
           };
         }
       }
@@ -255,4 +269,20 @@ export const wallpaperBridge = {
     }
   },
 
+  /**
+   * Copies arbitrary text to the Android clipboard so the user can share
+   * diagnostics (e.g. a captured log) with a developer.
+   */
+  copyToClipboard(text: string): void {
+    try {
+      const nativeModule = getNativeModule();
+      if (nativeModule && typeof nativeModule.copyToClipboard === 'function') {
+        nativeModule.copyToClipboard(text);
+      } else {
+        console.warn('copyToClipboard native method is not available');
+      }
+    } catch (error) {
+      console.warn('copyToClipboard failed', error);
+    }
+  },
 };

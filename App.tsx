@@ -12,7 +12,6 @@ import {
   Image,
   Modal,
   Pressable,
-  SafeAreaView,
   StatusBar,
   StyleSheet,
   Text,
@@ -24,15 +23,13 @@ import type { ImageStyle, StyleProp, ViewStyle } from 'react-native';
 import type { NativeScrollEvent, NativeSyntheticEvent } from 'react-native';
 import Video, { ViewType } from 'react-native-video';
 import type { ReactVideoSource, VideoRef } from 'react-native-video';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { ActionButton } from './src/components/ActionButton';
 import { GeometricArt } from './src/components/GeometricArt';
-import {
-  bundledWallpapers,
-  liveWallpapers,
-  staticWallpapers,
-} from './src/data/bundledWallpapers';
+import { bundledWallpapers } from './src/data/bundledWallpapers';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
-import type { Wallpaper } from './src/types';
+import { copyLogs, startLogCapture, logEvent } from './src/services/logService';
+import type { Wallpaper, WallpaperCapabilities } from './src/types';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────
 
@@ -50,6 +47,7 @@ class ErrorBoundary extends React.Component<
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error('App ErrorBoundary caught:', error, info);
+    logEvent('error', 'App ErrorBoundary caught:', error, info);
   }
 
   render() {
@@ -62,9 +60,19 @@ class ErrorBoundary extends React.Component<
               {this.state.error?.message ?? 'An unexpected error occurred.'}
             </Text>
             <ActionButton
-              label="Restart"
-              onPress={() => this.setState({ hasError: false, error: null })}
+              label="Copy Logs"
+              tone="secondary"
+              onPress={() => {
+                copyLogs();
+                Alert.alert('Logs Copied', 'Logs have been copied to your clipboard. You can paste and share them.');
+              }}
             />
+            <View style={styles.errorBoundaryActions}>
+              <ActionButton
+                label="Restart"
+                onPress={() => this.setState({ hasError: false, error: null })}
+              />
+            </View>
           </View>
         </SafeAreaView>
       );
@@ -260,24 +268,29 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
                   ]}
                 />
               </View>
-              <Text style={styles.durationLabel}>Rotate video before applying</Text>
+              <Text style={styles.durationLabel}>Video orientation</Text>
               <View style={styles.rotationRow}>
-                {([0, 90, 180, 270] as const).map(degrees => (
+                {([
+                  { label: 'Horizontal', value: 0 },
+                  { label: 'Vertical', value: 90 },
+                ] as const).map(option => (
                   <Pressable
-                    key={degrees}
+                    key={option.value}
                     accessibilityRole="button"
-                    accessibilityLabel={`Rotate ${degrees} degrees`}
-                    onPress={() => setVideoRotation(degrees)}
+                    accessibilityLabel={`${option.label} orientation`}
+                    onPress={() => setVideoRotation(option.value)}
                     style={[
                       styles.rotationButton,
-                      videoRotation === degrees && styles.rotationButtonSelected,
+                      videoRotation === option.value && styles.rotationButtonSelected,
                     ]}>
-                    <Text style={styles.rotationButtonText}>{degrees}°</Text>
+                    <Text style={styles.rotationButtonText}>{option.label}</Text>
                   </Pressable>
                 ))}
               </View>
               {videoRotation !== 0 && (
-                <Text style={styles.rotationHint}>Video rotates {videoRotation}° clockwise</Text>
+                <Text style={styles.rotationHint}>
+                  Video rotates 90° clockwise (portrait)
+                </Text>
               )}
               <Pressable
                 accessibilityRole="checkbox"
@@ -334,7 +347,19 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
             <ActionButton label="Cancel" tone="secondary" onPress={onClose} style={styles.modalButton} />
             <ActionButton label="Create" onPress={handleCreate} style={styles.modalButton} />
           </View>
-          {errorMessage && <Text style={styles.errorText}>{errorMessage}</Text>}
+          {errorMessage && (
+            <View style={styles.errorRow}>
+              <Text style={styles.errorText}>{errorMessage}</Text>
+              <ActionButton
+                label="Copy Logs"
+                tone="secondary"
+                onPress={() => {
+                  copyLogs();
+                  Alert.alert('Logs Copied', 'Logs have been copied to your clipboard. You can paste and share them.');
+                }}
+              />
+            </View>
+          )}
         </View>
       </View>
     </Modal>
@@ -348,9 +373,16 @@ type DetailModalProps = {
   onClose: () => void;
   onApplied: (id: string) => void;
   onWallpaperUpdated: (updated: Wallpaper) => void;
+  livePickerAvailable?: boolean;
 };
 
-function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdated }: DetailModalProps) {
+function WallpaperDetailModal({
+  wallpaper,
+  onClose,
+  onApplied,
+  onWallpaperUpdated,
+  livePickerAvailable = true,
+}: DetailModalProps) {
   const [isApplying, setIsApplying] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const [videoError, setVideoError] = React.useState(false);
@@ -383,7 +415,9 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
     setIsApplying(false);
     setVideoError(false);
     setImageError(false);
-    setRotation(wallpaper?.rotation ?? 0);
+    setRotation(
+      wallpaper?.rotation === 90 || wallpaper?.rotation === 270 ? 90 : 0,
+    );
   }, [wallpaper?.id]);
 
   // Bundled (embedded) videos in release resolve to a resource identifier
@@ -463,11 +497,15 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
           );
           onClose();
         } else {
-          setErrorMessage(result.error ?? 'Android could not open the wallpaper picker.');
+          const applyError =
+            result.error ?? 'Android could not open the wallpaper picker.';
+          setErrorMessage(applyError);
+          logEvent('error', `applyWallpaper failed for "${wallpaper.title}":`, applyError);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'An unexpected error occurred.';
         setErrorMessage(message);
+        logEvent('error', `applyWallpaper threw for "${wallpaper.title}":`, error);
       } finally {
         setIsApplying(false);
       }
@@ -544,10 +582,10 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
               <Text style={styles.previewLabel}>IMAGE PREVIEW UNAVAILABLE</Text>
               <Text style={styles.videoErrorHint}>Try selecting another image</Text>
             </View>
-          ) : wallpaper.kind === 'video' && !isBundledVideo && wallpaper.videoUri && !videoError ? (
+          ) : wallpaper.kind === 'video' && !videoError ? (
             <Video
               key={wallpaper.id}
-              source={toVideoSource(wallpaper.source ?? { uri: wallpaper.videoUri })}
+              source={resolveVideoPreviewSource(wallpaper, preparedUri)}
               style={[styles.videoPreview, previewRotationStyle]}
               resizeMode="cover"
               viewType={ViewType.TEXTURE}
@@ -558,45 +596,19 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
               playWhenInactive={false}
               onError={() => setVideoError(true)}
             />
-          ) : wallpaper.kind === 'video' && isBundledVideo && isRemotePreview && !videoError ? (
-            <Video
-              key={`${wallpaper.id}-remote`}
-              source={toVideoSource({ uri: videoUri })}
-              style={[styles.videoPreview, previewRotationStyle]}
+          ) : wallpaper.kind === 'video' && wallpaper.poster ? (
+            <Image
+              source={wallpaper.poster}
               resizeMode="cover"
-              viewType={ViewType.TEXTURE}
-              repeat={wallpaper.loop !== false}
-              paused={false}
-              muted={!wallpaper.audio}
-              playInBackground={true}
-              playWhenInactive={false}
-              onError={() => setVideoError(true)}
+              resizeMethod="resize"
+              style={styles.videoPreview as StyleProp<ImageStyle>}
             />
-          ) : wallpaper.kind === 'video' && isBundledVideo && preparedUri && !videoError ? (
-            <Video
-              key={`${wallpaper.id}-${preparedUri}`}
-              source={toVideoSource({ uri: preparedUri })}
-              style={[styles.videoPreview, previewRotationStyle]}
-              resizeMode="cover"
-              viewType={ViewType.TEXTURE}
-              repeat={wallpaper.loop !== false}
-              paused={false}
-              muted={!wallpaper.audio}
-              playInBackground={true}
-              playWhenInactive={false}
-              onError={() => setVideoError(true)}
-            />
-          ) : wallpaper.kind === 'video' && videoError ? (
+          ) : wallpaper.kind === 'video' ? (
             <View style={[styles.preview, { backgroundColor: wallpaper.accent }]}>
               <Text style={styles.previewLabel}>VIDEO PREVIEW UNAVAILABLE</Text>
               <Text style={styles.videoErrorHint}>
                 Try selecting an MP4 or H.264 video
               </Text>
-            </View>
-          ) : wallpaper.kind === 'video' ? (
-            <View style={[styles.preview, { backgroundColor: wallpaper.accent }]}>
-              <ActivityIndicator size="large" color="#22D3EE" />
-              <Text style={styles.previewLabel}>LOADING VIDEO PREVIEW…</Text>
             </View>
           ) : (
             <AnimatedPreview accent={wallpaper.accent} />
@@ -611,21 +623,24 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
                 Plays for {wallpaper.playbackDuration ?? 30} seconds
                 {wallpaper.loop === false ? ' once' : ' on repeat'}
                 {wallpaper.audio ? ' with audio' : ' muted'}
-                {rotation !== 0 ? ` · rotated ${rotation}°` : ''}
+                {rotation !== 0 ? ' · portrait' : ' · horizontal'}
               </Text>
-              <Text style={styles.durationLabel}>Rotate before applying</Text>
+              <Text style={styles.durationLabel}>Video orientation</Text>
               <View style={styles.rotationRow}>
-                {([0, 90, 180, 270] as const).map(degrees => (
+                {([
+                  { label: 'Horizontal', value: 0 },
+                  { label: 'Vertical', value: 90 },
+                ] as const).map(option => (
                   <Pressable
-                    key={degrees}
+                    key={option.value}
                     accessibilityRole="button"
-                    accessibilityLabel={`Rotate video ${degrees} degrees`}
-                    onPress={() => setRotation(degrees)}
+                    accessibilityLabel={`${option.label} orientation`}
+                    onPress={() => setRotation(option.value)}
                     style={[
                       styles.rotationButton,
-                      rotation === degrees && styles.rotationButtonSelected,
+                      rotation === option.value && styles.rotationButtonSelected,
                     ]}>
-                    <Text style={styles.rotationButtonText}>{degrees}°</Text>
+                    <Text style={styles.rotationButtonText}>{option.label}</Text>
                   </Pressable>
                 ))}
               </View>
@@ -671,6 +686,12 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
             </>
           )}
 
+          {wallpaper.kind === 'video' && !livePickerAvailable && (
+            <Text style={styles.unsupportedHint}>
+              This device has no live wallpaper picker, so live videos cannot be applied. Use a
+              static wallpaper instead.
+            </Text>
+          )}
           <Text style={styles.previewOnlyLabel}>
             Preview only. Choose a destination below to apply.
           </Text>
@@ -694,7 +715,19 @@ function WallpaperDetailModal({ wallpaper, onClose, onApplied, onWallpaperUpdate
               style={styles.modalButton}
             />
           </View>
-          {errorMessage && <Text style={styles.errorText}>{errorMessage}</Text>}
+          {errorMessage && (
+            <View style={styles.errorRow}>
+              <Text style={styles.errorText}>{errorMessage}</Text>
+              <ActionButton
+                label="Copy Logs"
+                tone="secondary"
+                onPress={() => {
+                  copyLogs();
+                  Alert.alert('Logs Copied', 'Logs have been copied to your clipboard. You can paste and share them.');
+                }}
+              />
+            </View>
+          )}
         </View>
       </View>
     </Modal>
@@ -732,6 +765,23 @@ function AnimatedPreview({ accent }: { accent: string }) {
 function toVideoSource(source: Wallpaper['source']): ReactVideoSource {
   if (source == null) return {};
   return source as unknown as ReactVideoSource;
+}
+
+/**
+ * Picks the most playable source for the video preview. Bundled videos carry
+ * an asset id (require()) that react-native-video can resolve in both dev
+ * (metro URL) and release. A prepared local file is preferred when available
+ * so the preview does not depend on the dev server being reachable.
+ */
+function resolveVideoPreviewSource(
+  wallpaper: Wallpaper,
+  preparedUri: string | null,
+): ReactVideoSource {
+  if (wallpaper.kind !== 'video') return {};
+  if (preparedUri) return { uri: preparedUri };
+  if (wallpaper.source != null) return toVideoSource(wallpaper.source);
+  if (wallpaper.videoUri) return { uri: wallpaper.videoUri };
+  return {};
 }
 
 /**
@@ -910,6 +960,8 @@ function Billboard({ wallpapers, onSelect, scrollY, viewportHeight, active = tru
 
 // ─── Media Grid (FlatList rows) ───────────────────────────────────────────
 
+type Section = 'live' | 'static';
+
 type GridRow =
   | { key: string; $rowType: 'billboard' }
   | { key: string; $rowType: 'header'; title: string; count: number }
@@ -967,7 +1019,11 @@ function WallpaperCard({
   );
 }
 
-function buildGridRows(): GridRow[] {
+function buildGridRows(
+  section: Section,
+  liveItems: Wallpaper[],
+  staticItems: Wallpaper[],
+): GridRow[] {
   const rows: GridRow[] = [{ key: 'billboard', $rowType: 'billboard' }];
   const pushSection = (title: string, items: Wallpaper[]) => {
     if (items.length === 0) return;
@@ -976,9 +1032,58 @@ function buildGridRows(): GridRow[] {
       rows.push({ key: `c-${title}-${start}`, $rowType: 'cards', cards: items.slice(start, start + 2) });
     }
   };
-  pushSection('Live wallpapers', liveWallpapers);
-  pushSection('Static wallpapers', staticWallpapers);
+  if (section === 'live') {
+    pushSection('Live wallpapers', liveItems);
+  } else {
+    pushSection('Static wallpapers', staticItems);
+  }
   return rows;
+}
+
+// ─── Section Tabs (top navigation) ───────────────────────────────────────
+
+const SECTION_TABS: { key: Section; label: string }[] = [
+  { key: 'live', label: 'Live' },
+  { key: 'static', label: 'Static' },
+];
+
+function SectionTabs({
+  section,
+  onChange,
+  liveCount,
+  staticCount,
+}: {
+  section: Section;
+  onChange: (section: Section) => void;
+  liveCount: number;
+  staticCount: number;
+}) {
+  return (
+    <View style={styles.tabBar}>
+      {SECTION_TABS.map(tab => {
+        const active = tab.key === section;
+        const count = tab.key === 'live' ? liveCount : staticCount;
+        return (
+          <Pressable
+            key={tab.key}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: active }}
+            accessibilityLabel={`${tab.label} wallpapers`}
+            onPress={() => onChange(tab.key)}
+            style={[styles.tabButton, active && styles.tabButtonActive]}>
+            <Text style={[styles.tabLabel, active && styles.tabLabelActive]}>
+              {tab.label}
+            </Text>
+            <View style={[styles.tabCountPill, active && styles.tabCountPillActive]}>
+              <Text style={[styles.tabCountText, active && styles.tabCountTextActive]}>
+                {count}
+              </Text>
+            </View>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
 }
 
 // ─── Main App ────────────────────────────────────────────────────────────
@@ -987,10 +1092,47 @@ function App() {
   const [wallpapers, setWallpapers] = React.useState(bundledWallpapers);
   const [selectedWallpaper, setSelectedWallpaper] = React.useState<Wallpaper | null>(null);
   const [isCreating, setIsCreating] = React.useState(false);
+  const [section, setSection] = React.useState<Section>('live');
   const [scrollY, setScrollY] = React.useState(0);
   const [viewportHeight, setViewportHeight] = React.useState(0);
+  const [capabilities, setCapabilities] = React.useState<WallpaperCapabilities | null>(null);
 
-  const rows = React.useMemo(() => buildGridRows(), []);
+  React.useEffect(() => {
+    startLogCapture();
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    wallpaperBridge
+      .getCapabilities()
+      .then(info => {
+        if (!cancelled) setCapabilities(info);
+      })
+      .catch(() => {
+        if (!cancelled) setCapabilities(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // On devices without a live wallpaper picker (budget/enterprise/kiosk ROMs),
+  // the Live tab explains the limitation instead of failing silently.
+  const livePickerUnavailable = capabilities != null && !capabilities.liveWallpaperPickerAvailable;
+
+  const liveItems = React.useMemo(
+    () => wallpapers.filter(item => item.kind !== 'static'),
+    [wallpapers],
+  );
+  const staticItems = React.useMemo(
+    () => wallpapers.filter(item => item.kind === 'static'),
+    [wallpapers],
+  );
+
+  const rows = React.useMemo(
+    () => buildGridRows(section, liveItems, staticItems),
+    [section, liveItems, staticItems],
+  );
 
   const handleScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     setScrollY(event.nativeEvent.contentOffset.y);
@@ -1027,7 +1169,7 @@ function App() {
       if (item.$rowType === 'billboard') {
         return (
           <Billboard
-            wallpapers={wallpapers}
+            wallpapers={section === 'live' ? liveItems : staticItems}
             onSelect={setSelectedWallpaper}
             scrollY={scrollY}
             viewportHeight={viewportHeight}
@@ -1051,7 +1193,7 @@ function App() {
         </View>
       );
     },
-    [wallpapers, scrollY, viewportHeight, selectedWallpaper],
+    [section, liveItems, staticItems, scrollY, viewportHeight, selectedWallpaper],
   );
 
   return (
@@ -1094,6 +1236,24 @@ function App() {
                     </Text>
                   </View>
                 </View>
+                <SectionTabs
+                  section={section}
+                  onChange={setSection}
+                  liveCount={liveItems.length}
+                  staticCount={staticItems.length}
+                />
+                {livePickerUnavailable && section === 'live' && (
+                  <View accessibilityRole="alert" style={styles.unsupportedBanner}>
+                    <Text style={styles.unsupportedBannerTitle}>
+                      Live wallpapers unavailable on this device
+                    </Text>
+                    <Text style={styles.unsupportedBannerText}>
+                      {capabilities?.setWallpaperAllowed
+                        ? 'This device has no live wallpaper picker. Static wallpapers still work — switch to the Static tab to apply them.'
+                        : 'Wallpaper changes are disabled by your device or company policy.'}
+                    </Text>
+                  </View>
+                )}
               </View>
             }
           />
@@ -1111,6 +1271,7 @@ function App() {
         onClose={() => setSelectedWallpaper(null)}
         onApplied={handleApplied}
         onWallpaperUpdated={handleWallpaperUpdated}
+        livePickerAvailable={capabilities?.liveWallpaperPickerAvailable ?? true}
       />
     </ErrorBoundary>
   );
@@ -1134,6 +1295,81 @@ const styles = StyleSheet.create({
   },
   header: {
     paddingBottom: 16,
+  },
+  tabBar: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderRadius: 14,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  tabButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    borderRadius: 10,
+    paddingVertical: 10,
+  },
+  tabButtonActive: {
+    backgroundColor: 'rgba(34, 211, 238, 0.18)',
+  },
+  tabLabel: {
+    color: 'rgba(240, 248, 255, 0.6)',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  tabLabelActive: {
+    color: '#22D3EE',
+  },
+  tabCountPill: {
+    minWidth: 22,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    alignItems: 'center',
+  },
+  tabCountPillActive: {
+    backgroundColor: 'rgba(34, 211, 238, 0.25)',
+  },
+  tabCountText: {
+    color: 'rgba(240, 248, 255, 0.6)',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  tabCountTextActive: {
+    color: '#22D3EE',
+  },
+  unsupportedBanner: {
+    marginTop: 14,
+    backgroundColor: 'rgba(245, 158, 11, 0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 158, 11, 0.4)',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  unsupportedBannerTitle: {
+    color: '#FCD34D',
+    fontSize: 13,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  unsupportedBannerText: {
+    color: 'rgba(253, 230, 138, 0.85)',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  unsupportedHint: {
+    color: '#FCD34D',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 14,
   },
   brandRow: {
     flexDirection: 'row',
@@ -1564,6 +1800,13 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
     marginTop: 14,
+    flexShrink: 1,
+  },
+  errorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 14,
   },
   loadingOverlay: {
     position: 'absolute',
@@ -1603,6 +1846,10 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 24,
     lineHeight: 20,
+  },
+  errorBoundaryActions: {
+    marginTop: 12,
+    alignSelf: 'stretch',
   },
 });
 

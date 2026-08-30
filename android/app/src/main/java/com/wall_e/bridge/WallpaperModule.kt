@@ -3,10 +3,14 @@ package com.wall_e.bridge
 import android.app.WallpaperManager
 import android.app.Activity
 import android.content.ComponentName
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.ActivityNotFoundException
+import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -182,7 +186,11 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     fun getCapabilities(promise: Promise) {
         try {
             val wallpaperManager = reactContext.getSystemService(WallpaperManager::class.java)
-            val supportsLive = wallpaperManager?.isWallpaperSupported == true
+            val supportsLive = wallpaperManager?.isWallpaperSupported ?: false
+            val setWallpaperAllowed = wallpaperManager?.isSetWallpaperAllowed ?: false
+            val hasLiveWallpaperFeature =
+                reactContext.packageManager.hasSystemFeature(PackageManager.FEATURE_LIVE_WALLPAPER)
+            val livePickerAvailable = hasLiveWallpaperFeature && liveWallpaperPickerAvailable()
 
             val featuresArray: WritableArray = Arguments.createArray().apply {
                 pushString("Doodle renderer")
@@ -194,6 +202,10 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
             val capabilities: WritableMap = Arguments.createMap().apply {
                 putBoolean("supportsLiveWallpaper", supportsLive)
+                putBoolean("setWallpaperAllowed", setWallpaperAllowed)
+                putBoolean("liveWallpaperPickerAvailable", livePickerAvailable)
+                putString("device", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                putString("androidVersion", Build.VERSION.RELEASE)
                 putInt("minSdk", 24)
                 putInt("targetSdk", 36)
                 putArray("features", featuresArray)
@@ -203,6 +215,10 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             Log.e(TAG, "Failed to get capabilities", error)
             val fallback: WritableMap = Arguments.createMap().apply {
                 putBoolean("supportsLiveWallpaper", false)
+                putBoolean("setWallpaperAllowed", true)
+                putBoolean("liveWallpaperPickerAvailable", false)
+                putString("device", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                putString("androidVersion", Build.VERSION.RELEASE)
                 putInt("minSdk", 24)
                 putInt("targetSdk", 36)
                 val fallbackFeatures: WritableArray = Arguments.createArray().apply {
@@ -215,6 +231,33 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 putArray("features", fallbackFeatures)
             }
             promise.resolve(fallback)
+        }
+    }
+
+    /**
+     * True when the system exposes a live wallpaper chooser that can actually
+     * resolve on this device. Some OEM/enterprise ROMs and low-end devices do
+     * not provide one even when the WallpaperService framework exists.
+     */
+    @ReactMethod
+    fun copyToClipboard(text: String) {
+        try {
+            val clipboard = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("wall_e logs", text))
+        } catch (_: Exception) {
+            Log.e(TAG, "copyToClipboard failed")
+        }
+    }
+
+    private fun liveWallpaperPickerAvailable(): Boolean {
+        return try {
+            val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
+            val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+                putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
+            }
+            reactContext.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY) != null
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -293,14 +336,26 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             else -> throw IllegalArgumentException("Unknown wallpaper destination: $destination")
         }
         postToUi {
-            openWallpaperConfirmation(component, flags)
-            val result: WritableMap = Arguments.createMap().apply {
-                putBoolean("ok", true)
-                putString("id", id)
-                putString("destination", destination)
-                putString("mode", "system-wallpaper-confirmation-$destination")
+            try {
+                openWallpaperConfirmation(component, flags)
+                val result: WritableMap = Arguments.createMap().apply {
+                    putBoolean("ok", true)
+                    putString("id", id)
+                    putString("destination", destination)
+                    putString("mode", "system-wallpaper-confirmation-$destination")
+                }
+                promise.resolve(result)
+            } catch (error: Exception) {
+                Log.e(TAG, "Live wallpaper picker unavailable for $destination", error)
+                val result: WritableMap = Arguments.createMap().apply {
+                    putBoolean("ok", false)
+                    putString("id", id)
+                    putString("destination", destination)
+                    putString("error", "This device does not support live wallpapers. Choose a static wallpaper instead.")
+                    putString("errorCode", "LIVE_WALLPAPER_UNAVAILABLE")
+                }
+                promise.resolve(result)
             }
-            promise.resolve(result)
         }
     }
 
@@ -369,7 +424,16 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 else -> WallpaperManager.FLAG_SYSTEM
             }
 
-            wallpaperManager.setBitmap(bitmap, null, true, flags)
+            // A crop hint matching the real display stops OEM skins from
+            // letterboxing or mis-cropping the image on very different screens.
+            val visibleCropHint: android.graphics.Rect? = try {
+                val metrics = reactContext.resources.displayMetrics
+                android.graphics.Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+            } catch (_: Exception) {
+                null
+            }
+
+            wallpaperManager.setBitmap(bitmap, visibleCropHint, true, flags)
             bitmap.recycle()
 
             Log.i(TAG, "Static wallpaper applied: id=$id destination=$destination")
@@ -542,16 +606,30 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     private fun startPickerActivity(intent: Intent) {
-        val activity = reactContext.currentActivity
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        if (activity != null) {
-            activity.startActivity(intent)
-        } else {
-            reactContext.startActivity(intent)
+        try {
+            val activity = reactContext.currentActivity
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            if (activity != null) {
+                activity.startActivity(intent)
+            } else {
+                reactContext.startActivity(intent)
+            }
+        } catch (error: ActivityNotFoundException) {
+            Log.e(TAG, "No activity found to handle intent: ${intent.action}", error)
+            throw error
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to start picker activity", error)
+            throw error
         }
     }
 
     private fun openWallpaperConfirmation(component: ComponentName, flags: Int) {
+        if (!liveWallpaperPickerAvailable()) {
+            throw ActivityNotFoundException(
+                "This device does not provide a live wallpaper picker. " +
+                    "Live wallpapers are unsupported here; static wallpapers still work."
+            )
+        }
         val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
             putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, component)
             putExtra("com.wall_e.WALLPAPER_DESTINATION", flags)

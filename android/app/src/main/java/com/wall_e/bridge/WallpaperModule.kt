@@ -228,24 +228,38 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
-            val mediaUri = resolveMediaUri(videoUri, "bundled_video", "mp4")
-            saveWallpaperConfig(id, kind, mediaUri.toString(), loop, playbackDuration, audio, "", rotation)
-            val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
-            val flags = when (destination.uppercase()) {
-                "HOME" -> WallpaperManager.FLAG_SYSTEM
-                "LOCK" -> WallpaperManager.FLAG_LOCK
-                "BOTH" -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
-                else -> throw IllegalArgumentException("Unknown wallpaper destination: $destination")
+            val normalizedRotation = rotation.coerceIn(0, 270)
+            if (normalizedRotation == 0) {
+                val mediaUri = resolveMediaUri(videoUri, "bundled_video", "mp4")
+                finishLiveApply(id, kind, destination, mediaUri.toString(), loop, playbackDuration, audio, 0, promise)
+                return
             }
-            openWallpaperConfirmation(component, flags)
 
-            val result: WritableMap = Arguments.createMap().apply {
-                putBoolean("ok", true)
-                putString("id", id)
-                putString("destination", destination)
-                putString("mode", "system-wallpaper-confirmation-$destination")
-            }
-            promise.resolve(result)
+            Thread {
+                try {
+                    val original = resolveMediaUri(videoUri, "bundled_video", "mp4")
+                    val rotatedUri = rotateVideoIfPossible(original, normalizedRotation)
+                    if (rotatedUri != null) {
+                        Log.i(TAG, "Rotation transcode succeeded; playing pre-rotated file with rotation=0")
+                        finishLiveApply(id, kind, destination, rotatedUri.toString(), loop, playbackDuration, audio, 0, promise)
+                    } else {
+                        Log.w(TAG, "Rotation transcode failed/unavailable; falling back to original with rotation=$normalizedRotation")
+                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, promise)
+                    }
+                } catch (error: Exception) {
+                    Log.e(TAG, "Failed to apply wallpaper (rotation path)", error)
+                    postToUi {
+                        val result: WritableMap = Arguments.createMap().apply {
+                            putBoolean("ok", false)
+                            putString("id", id)
+                            putString("destination", destination)
+                            putString("error", "Unable to open the wallpaper picker: ${error.message}")
+                            putString("errorCode", "WALLPAPER_APPLY_ERROR")
+                        }
+                        promise.resolve(result)
+                    }
+                }
+            }.start()
         } catch (error: Exception) {
             Log.e(TAG, "Failed to apply wallpaper", error)
             val result: WritableMap = Arguments.createMap().apply {
@@ -256,6 +270,56 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 putString("errorCode", "WALLPAPER_APPLY_ERROR")
             }
             promise.resolve(result)
+        }
+    }
+
+    private fun finishLiveApply(
+        id: String,
+        kind: String,
+        destination: String,
+        mediaUri: String,
+        loop: Boolean,
+        playbackDuration: Int,
+        audio: Boolean,
+        rotation: Int,
+        promise: Promise,
+    ) {
+        saveWallpaperConfig(id, kind, mediaUri, loop, playbackDuration, audio, "", rotation)
+        val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
+        val flags = when (destination.uppercase()) {
+            "HOME" -> WallpaperManager.FLAG_SYSTEM
+            "LOCK" -> WallpaperManager.FLAG_LOCK
+            "BOTH" -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
+            else -> throw IllegalArgumentException("Unknown wallpaper destination: $destination")
+        }
+        postToUi {
+            openWallpaperConfirmation(component, flags)
+            val result: WritableMap = Arguments.createMap().apply {
+                putBoolean("ok", true)
+                putString("id", id)
+                putString("destination", destination)
+                putString("mode", "system-wallpaper-confirmation-$destination")
+            }
+            promise.resolve(result)
+        }
+    }
+
+    private fun rotateVideoIfPossible(src: Uri, rotation: Int): Uri? {
+        if (src.scheme != "file") return null
+        val srcPath = src.path ?: return null
+        val file = File(srcPath)
+        if (!file.exists() || !file.isFile) return null
+        val dir = File(reactContext.filesDir, "wallpapers").apply { mkdirs() }
+        val dst = File(dir, "rotated_${file.nameWithoutExtension}_r${rotation}.mp4")
+        if (dst.exists() && dst.length() > 0L) {
+            Log.i(TAG, "Reusing cached rotated video: ${dst.absolutePath}")
+            return Uri.fromFile(dst)
+        }
+        return if (VideoRotationProcessor.transcode(srcPath, dst.absolutePath, rotation)) {
+            Log.i(TAG, "Rotation transcode done: ${dst.absolutePath} bytes=${dst.length()}")
+            Uri.fromFile(dst)
+        } else {
+            null
         }
     }
 

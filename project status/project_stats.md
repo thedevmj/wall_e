@@ -143,6 +143,7 @@ The wallpaper service receives an app-owned file that remains readable after the
 - `W_DURATION`: playback duration clamped from 1 to 30 seconds
 - `W_AUDIO`: boolean audio setting
 - `W_ACCENT`: accent color, with a native fallback if empty
+- `W_ROTATION`: rotation in degrees `0/90/180/270` (added with the video rotation feature)
 
 `WallpaperService.loadConfiguration()` reads the same keys. Keep these names and value types synchronized if the native contract changes.
 
@@ -248,6 +249,12 @@ The Android compile currently passes. The React Native Jest render test currentl
 
 ## Recent Fixes (Implemented)
 - Built-in wallpapers now work end-to-end: every predefined wallpaper is a `doodle`, so Preview shows the animated pre-renderer and Apply always reaches the native doodle renderer (no "Choose a video before applying" dead end for wallpapers that ship with the app).
+- Media normalization (build-time ffmpeg): all 12 bundled live-video MP4s were re-encoded in place to H.264 High / 720x1280 / SAR 1:1 / 30 fps / CRF 22 / no audio / `+faststart`. The old "HQ" files were HEVC Main 10 / 1920x1080 / ~15 Mbps landscapes (software-decode overkill on the device, causing lag and "will not load"). Backups of the originals are in `C:\Users\JUNAID~1\AppData\Local\Temp\opencode\wallpaper_originals\`. Filenames were preserved because `require()`/raw-resource mapping depends on them. Total bundle shrank from ~117 MB to ~37 MB. Posters were regenerated from the normalized frames into `assets/livewallpapers/posters/`.
+- Device rotation is now handled by an on-device transcode: `android/app/src/main/java/com/wall_e/bridge/VideoRotationProcessor.kt` decodes with hardware MediaCodec, rotates with a GLES2 pass, and re-encodes to a cached pre-rotated H.264 file (`rotated_<name>_r<deg>.mp4`). When the transcode succeeds, `applyWallpaper` saves the config with the pre-rotated path and `W_ROTATION=0` so playback goes through the proven direct-surface path. On failure, rotation falls through to the runtime GL/EGL renderer as a safety net. Cached per wallpaper+rotation so re-applies are instant.
+- `WallpaperService` decoders are hardware-first with only `DefaultRenderersFactory(...).setEnableDecoderFallback(true)` (removed the software-only `MediaCodecSelector`), video surfaces use `C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING`, and `drawRotatedBitmap` cover-fills the screen (`maxOf` scale) inside `canvas.rotate`.
+- One-shot enforcement fixed: loop mode `seekTo(0)`; one-shot holds the final frame without churn.
+- `WallpaperService.onVisibilityChanged` now restarts the player when any config field changes (kind/URI/loop/audio/duration/rotation), not just kind+URI.
+- App `WallpaperDetailModal` gained a Play continuously / Play once toggle (checkbox style) that writes `wallpaper.loop`; preview repeat and apply both respect it.
 - Video import is smoother: the copy + duration probe run on a background thread and the promise resolves on the React UI queue, so the preview does not jank while a large video is imported.
 - `WallpaperService` stops the Choreographer frame loop while ExoPlayer renders directly to the surface and re-enables it for doodles, frame-fallback playback, and error screens (battery/CPU win; the previous loop posted empty frame callbacks continuously during video playback).
 - The W_DURATION enforcement timer and the frame-fallback decode task are now cancelled/removed when the player is released, so visibility toggles no longer leak Runnables.

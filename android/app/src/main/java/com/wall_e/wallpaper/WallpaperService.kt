@@ -192,10 +192,22 @@ class LiveWallpaperService : WallpaperService() {
             if (visible) {
                 val previousKind = wallpaperKind
                 val previousUri = configuredVideoUriString
+                val previousLoop = shouldLoop
+                val previousAudio = includeAudio
+                val previousDuration = playbackDuration
+                val previousRotation = videoRotationDegrees
                 loadConfiguration()
 
-                if (previousKind != wallpaperKind || previousUri != configuredVideoUriString) {
-                    Log.i(TAG, "URI CHANGED: $previousUri -> $configuredVideoUriString")
+                val configChanged =
+                    previousKind != wallpaperKind ||
+                        previousUri != configuredVideoUriString ||
+                        previousLoop != shouldLoop ||
+                        previousAudio != includeAudio ||
+                        previousDuration != playbackDuration ||
+                        previousRotation != videoRotationDegrees
+
+                if (configChanged) {
+                    Log.i(TAG, "CONFIG CHANGED: kind $previousKind->$wallpaperKind, uri $previousUri->$configuredVideoUriString, loop $previousLoop->$shouldLoop, audio $previousAudio->$includeAudio, duration $previousDuration->$playbackDuration, rotation $previousRotation->$videoRotationDegrees")
                     releaseExoPlayer()
                     releaseStaticImage()
                     loadStaticImage()

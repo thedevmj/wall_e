@@ -52,9 +52,11 @@ class VideoGlRenderer(
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             uniform samplerExternalOES uTexture;
+            uniform float uFade;
             varying vec2 vTexCoord;
             void main() {
-                gl_FragColor = texture2D(uTexture, vTexCoord);
+                vec4 c = texture2D(uTexture, vTexCoord);
+                gl_FragColor = vec4(c.rgb * (1.0 - uFade), 1.0);
             }
         """
     }
@@ -67,6 +69,7 @@ class VideoGlRenderer(
     private var uniformMvpLoc = -1
     private var uniformStLoc = -1
     private var uniformTextureLoc = -1
+    private var uniformFadeLoc = -1
 
     private var surfaceWidth = max(initialWidth, 1)
     private var surfaceHeight = max(initialHeight, 1)
@@ -78,6 +81,12 @@ class VideoGlRenderer(
 
     @Volatile
     private var frameAvailable = false
+
+    @Volatile
+    private var fadeAlpha = 0f
+
+    @Volatile
+    private var hasFrame = false
 
     var framesRendered = 0
         private set
@@ -117,6 +126,11 @@ class VideoGlRenderer(
         }
     }
 
+    /** Set the black-fade blend (0..1) applied on top of the video each frame. */
+    fun setFadeAlpha(alpha: Float) {
+        fadeAlpha = alpha.coerceIn(0f, 1f)
+    }
+
     fun updateSurfaceSize(width: Int, height: Int) {
         surfaceWidth = max(width, 1)
         surfaceHeight = max(height, 1)
@@ -133,15 +147,21 @@ class VideoGlRenderer(
     fun render(): Boolean {
         if (hasError || released) return false
         val texture = surfaceTexture ?: return false
-        if (!frameAvailable) return false
+        val newFrame = frameAvailable
+        // Draw when a fresh frame arrives, or when a fade is active so the black
+        // blend keeps progressing even while ExoPlayer is paused on a static frame.
+        if (!newFrame && fadeAlpha <= 0f) return false
         frameAvailable = false
         try {
             if (!eglMakeCurrent()) {
                 hasError = true
                 return false
             }
-            texture.updateTexImage()
-            texture.getTransformMatrix(transformMatrix)
+            if (newFrame || !hasFrame) {
+                texture.updateTexImage()
+                texture.getTransformMatrix(transformMatrix)
+                hasFrame = true
+            }
             drawFrame(transformMatrix)
             eglSwapBuffers()
             framesRendered++
@@ -194,6 +214,7 @@ class VideoGlRenderer(
         uniformMvpLoc = GLES20.glGetUniformLocation(program, "uMvp")
         uniformStLoc = GLES20.glGetUniformLocation(program, "uSTMatrix")
         uniformTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
+        uniformFadeLoc = GLES20.glGetUniformLocation(program, "uFade")
 
         val texIds = IntArray(1)
         GLES20.glGenTextures(1, texIds, 0)
@@ -279,6 +300,7 @@ class VideoGlRenderer(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
         GLES20.glUniform1i(uniformTextureLoc, 0)
+        GLES20.glUniform1f(uniformFadeLoc, fadeAlpha)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(0)

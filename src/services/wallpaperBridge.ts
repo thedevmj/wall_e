@@ -24,9 +24,11 @@ type NativeImageResult = {
 type NativeWallpaperModule = {
   getCapabilities?: () => Promise<unknown>;
   applyWallpaper?: (...args: unknown[]) => Promise<unknown>;
+  resolvePendingApply?: () => Promise<unknown>;
   pickVideo?: () => Promise<unknown>;
   pickImage?: () => Promise<unknown>;
   prepareBundledMedia?: (source: string, kind: string) => Promise<unknown>;
+  getBatteryLevel?: () => Promise<unknown>;
   copyToClipboard?: (text: string) => void;
 };
 
@@ -34,6 +36,7 @@ const fallbackCapabilities: WallpaperCapabilities = {
   supportsLiveWallpaper: false,
   setWallpaperAllowed: true,
   liveWallpaperPickerAvailable: false,
+  canSetLiveWallpaperDirectly: false,
   minSdk: 24,
   targetSdk: 36,
   features: ['Doodle renderer', 'Video preview', 'Static image wallpaper', 'Wallpaper picker'],
@@ -83,6 +86,7 @@ export const wallpaperBridge = {
             supportsLiveWallpaper?: unknown;
             setWallpaperAllowed?: unknown;
             liveWallpaperPickerAvailable?: unknown;
+            canSetLiveWallpaperDirectly?: unknown;
             minSdk?: unknown;
             targetSdk?: unknown;
             features?: unknown;
@@ -96,6 +100,7 @@ export const wallpaperBridge = {
               capabilities.liveWallpaperPickerAvailable === true ||
               (capabilities.liveWallpaperPickerAvailable == null &&
                 capabilities.supportsLiveWallpaper === true),
+            canSetLiveWallpaperDirectly: capabilities.canSetLiveWallpaperDirectly === true,
             minSdk: Number.isFinite(Number(capabilities.minSdk)) ? Number(capabilities.minSdk) : 24,
             targetSdk: Number.isFinite(Number(capabilities.targetSdk)) ? Number(capabilities.targetSdk) : 36,
             features: Array.isArray(capabilities.features)
@@ -115,7 +120,7 @@ export const wallpaperBridge = {
 
   async applyWallpaper(
     id: string,
-    kind: 'doodle' | 'video' | 'static',
+    kind: 'doodle' | 'video' | 'static' | 'battery' | 'pixel',
     destination: 'HOME' | 'LOCK' | 'BOTH',
     videoUri?: string,
     loop = true,
@@ -160,6 +165,36 @@ export const wallpaperBridge = {
       console.warn('Wallpaper apply failed', error);
       const message = error instanceof Error ? error.message : 'Unable to open the wallpaper preview';
       return { ok: false, id, destination, error: message, errorCode: 'APPLY_EXCEPTION' };
+    }
+  },
+
+  /**
+   * Resolves a pending live wallpaper apply. Call after the system wallpaper
+   * picker returns to the foreground. Native code promotes the pending preview
+   * to the committed wallpaper only if it was actually confirmed, otherwise the
+   * selection is discarded and the previous wallpaper is left untouched.
+   *
+   * Returns true when the wallpaper was committed as set.
+   */
+  async resolvePendingApply(): Promise<boolean> {
+    try {
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.resolvePendingApply !== 'function') {
+        return false;
+      }
+      const result = await withTimeout(
+        nativeModule.resolvePendingApply(),
+        NATIVE_CALL_TIMEOUT_MS,
+        'resolvePendingApply',
+      );
+      if (result === true) return true;
+      if (result !== null && typeof result === 'object' && !Array.isArray(result)) {
+        return (result as { committed?: unknown }).committed === true;
+      }
+      return false;
+    } catch (error) {
+      console.warn('resolvePendingApply failed', error);
+      return false;
     }
   },
 
@@ -265,6 +300,35 @@ export const wallpaperBridge = {
       return asString(prepared.uri) ?? null;
     } catch (error) {
       console.warn('Embedded media preparation failed', error);
+      return null;
+    }
+  },
+
+  /**
+   * Reads the current battery level (0..100) and charging status from the
+   * native battery manager. Used for the battery fluid wallpaper preview.
+   */
+  async getBatteryLevel(): Promise<{ level: number; charging: boolean } | null> {
+    try {
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.getBatteryLevel !== 'function') {
+        return null;
+      }
+      const result = await withTimeout(
+        nativeModule.getBatteryLevel(),
+        NATIVE_CALL_TIMEOUT_MS,
+        'getBatteryLevel',
+      );
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const battery = result as { level?: unknown; charging?: unknown };
+      return {
+        level: Number.isFinite(Number(battery.level)) ? Number(battery.level) : 0,
+        charging: battery.charging === true,
+      };
+    } catch (error) {
+      console.warn('getBatteryLevel failed', error);
       return null;
     }
   },

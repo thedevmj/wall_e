@@ -1,6 +1,6 @@
 import type { ImageSourcePropType } from 'react-native';
 
-export type WallpaperKind = 'doodle' | 'video' | 'static';
+export type WallpaperKind = 'doodle' | 'video' | 'static' | 'battery' | 'pixel';
 
 export type Wallpaper = {
   id: string;
@@ -34,6 +34,7 @@ export type WallpaperCapabilities = {
   supportsLiveWallpaper: boolean;
   setWallpaperAllowed: boolean;
   liveWallpaperPickerAvailable: boolean;
+  canSetLiveWallpaperDirectly: boolean;
   minSdk: number;
   targetSdk: number;
   features: string[];

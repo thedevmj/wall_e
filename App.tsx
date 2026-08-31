@@ -8,12 +8,12 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   FlatList,
   Image,
   Modal,
   Pressable,
   StatusBar,
-  StyleSheet,
   Text,
   TextInput,
   View,
@@ -25,10 +25,14 @@ import Video, { ViewType } from 'react-native-video';
 import type { ReactVideoSource, VideoRef } from 'react-native-video';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { ActionButton } from './src/components/ActionButton';
+import { BatteryFluidPreview } from './src/components/BatteryFluidPreview';
+import { PixelArtPreview } from './src/components/PixelArtPreview';
 import { GeometricArt } from './src/components/GeometricArt';
 import { bundledWallpapers } from './src/data/bundledWallpapers';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
 import { copyLogs, startLogCapture, logEvent } from './src/services/logService';
+import { showToast } from './src/services/toast';
+import { styles } from './src/styles';
 import type { Wallpaper, WallpaperCapabilities } from './src/types';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────
@@ -373,6 +377,7 @@ type DetailModalProps = {
   onClose: () => void;
   onApplied: (id: string) => void;
   onWallpaperUpdated: (updated: Wallpaper) => void;
+  onPickerOpened: (id: string) => void;
   livePickerAvailable?: boolean;
 };
 
@@ -381,14 +386,17 @@ function WallpaperDetailModal({
   onClose,
   onApplied,
   onWallpaperUpdated,
+  onPickerOpened,
   livePickerAvailable = true,
 }: DetailModalProps) {
   const [isApplying, setIsApplying] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const [videoError, setVideoError] = React.useState(false);
   const [imageError, setImageError] = React.useState(false);
+  const [videoLoaded, setVideoLoaded] = React.useState(false);
   const [rotation, setRotation] = React.useState(0);
   const [preparedUri, setPreparedUri] = React.useState<string | null>(null);
+  const [batteryInfo, setBatteryInfo] = React.useState<{ level: number; charging: boolean } | null>(null);
 
   const isBundledVideo = wallpaper?.kind === 'video' && wallpaper?.source != null;
   const videoUri = wallpaper?.videoUri ?? '';
@@ -415,10 +423,31 @@ function WallpaperDetailModal({
     setIsApplying(false);
     setVideoError(false);
     setImageError(false);
+    setVideoLoaded(false);
     setRotation(
       wallpaper?.rotation === 90 || wallpaper?.rotation === 270 ? 90 : 0,
     );
   }, [wallpaper?.id]);
+
+  // Read the real battery level/charging state for the battery fluid preview.
+  React.useEffect(() => {
+    if (wallpaper?.kind !== 'battery') {
+      setBatteryInfo(null);
+      return undefined;
+    }
+    let cancelled = false;
+    wallpaperBridge
+      .getBatteryLevel()
+      .then(info => {
+        if (!cancelled && info) setBatteryInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setBatteryInfo({ level: 50, charging: false });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [wallpaper?.id, wallpaper?.kind]);
 
   // Bundled (embedded) videos in release resolve to a resource identifier
   // that must be copied to a playable local file first. In dev the URI is
@@ -456,17 +485,9 @@ function WallpaperDetailModal({
     }
   }, [rotation, wallpaper, onWallpaperUpdated]);
 
-  const applySelected = React.useCallback(
+  const performApply = React.useCallback(
     async (destination: 'HOME' | 'LOCK' | 'BOTH') => {
       if (!wallpaper) return;
-      if (wallpaper.kind === 'video' && !wallpaper.videoUri) {
-        setErrorMessage('Choose a video before applying this wallpaper.');
-        return;
-      }
-      if (wallpaper.kind === 'static' && !wallpaper.imageUri) {
-        setErrorMessage('Choose an image before applying this wallpaper.');
-        return;
-      }
       setIsApplying(true);
       setErrorMessage(null);
       try {
@@ -487,30 +508,77 @@ function WallpaperDetailModal({
           rotation,
         );
         if (result.ok) {
+          const directSet =
+            result.mode != null && result.mode.startsWith('direct-live-wallpaper');
+          // Direct set commits immediately (deterministic). For static wallpapers
+          // native commits with setBitmap. Only the system-picker fallback still
+          // needs to be resolved on resume (see onPickerOpened / AppState).
           onApplied(wallpaper.id);
-          Alert.alert(
-            'Wallpaper Applied',
-            wallpaper.kind === 'static'
-              ? '"' + wallpaper.title + '" is now your ' + destination.toLowerCase() + ' wallpaper.'
-              : `"${wallpaper.title}" is being set as your ${destination.toLowerCase()} wallpaper. Follow the system prompt to confirm.`,
-            [{ text: 'OK' }],
-          );
+          if (!directSet && wallpaper.kind !== 'static') {
+            onPickerOpened(wallpaper.id);
+          }
+          if (directSet) {
+            showToast(`✓ "${wallpaper.title}" set as ${destination.toLowerCase()} wallpaper`);
+            Alert.alert(
+              'Wallpaper Set',
+              `"${wallpaper.title}" is now your ${destination.toLowerCase()} wallpaper.`,
+              [{ text: 'OK' }],
+            );
+          } else if (wallpaper.kind === 'static') {
+            showToast(`✓ "${wallpaper.title}" set as ${destination.toLowerCase()} wallpaper`);
+            Alert.alert(
+              'Wallpaper Applied',
+              '"' + wallpaper.title + '" is now your ' + destination.toLowerCase() + ' wallpaper.',
+              [{ text: 'OK' }],
+            );
+          } else {
+            showToast('Follow the system prompt to confirm the wallpaper', 'long');
+          }
           onClose();
         } else {
           const applyError =
             result.error ?? 'Android could not open the wallpaper picker.';
           setErrorMessage(applyError);
+          showToast(applyError, 'long');
           logEvent('error', `applyWallpaper failed for "${wallpaper.title}":`, applyError);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : 'An unexpected error occurred.';
         setErrorMessage(message);
+        showToast(message, 'long');
         logEvent('error', `applyWallpaper threw for "${wallpaper.title}":`, error);
       } finally {
         setIsApplying(false);
       }
     },
-    [wallpaper, rotation, preparedUri, isBundledVideo, onApplied, onClose],
+    [wallpaper, rotation, preparedUri, isBundledVideo, onApplied, onPickerOpened, onClose],
+  );
+
+  const applySelected = React.useCallback(
+    (destination: 'HOME' | 'LOCK' | 'BOTH') => {
+      if (!wallpaper) return;
+      if (wallpaper.kind === 'video' && !wallpaper.videoUri) {
+        setErrorMessage('Choose a video before applying this wallpaper.');
+        showToast('Choose a video before applying', 'long');
+        return;
+      }
+      if (wallpaper.kind === 'static' && !wallpaper.imageUri) {
+        setErrorMessage('Choose an image before applying this wallpaper.');
+        showToast('Choose an image before applying', 'long');
+        return;
+      }
+      // Static and direct-set wallpapers take effect immediately with no system
+      // prompt, so confirm in-app first to avoid accidental one-tap sets.
+      Alert.alert(
+        'Set as wallpaper',
+        `Set "${wallpaper.title}" as your ${destination.toLowerCase()} wallpaper?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Set Wallpaper', onPress: () => performApply(destination) },
+        ],
+      );
+    },
+    [wallpaper, performApply],
   );
 
   const chooseVideoForSelected = React.useCallback(async () => {
@@ -520,6 +588,7 @@ function WallpaperDetailModal({
       const pickedVideo = await wallpaperBridge.pickVideo();
       if (!pickedVideo) {
         setErrorMessage('No video was selected. Please try again.');
+        showToast('No video selected', 'long');
         return;
       }
       const updatedWallpaper: Wallpaper = {
@@ -529,8 +598,10 @@ function WallpaperDetailModal({
       };
       onWallpaperUpdated(updatedWallpaper);
       setVideoError(false);
+      showToast('Video selected');
     } catch {
       setErrorMessage('The selected video could not be read. Please choose another video.');
+      showToast('Could not read that video', 'long');
     }
   }, [wallpaper, onWallpaperUpdated]);
 
@@ -541,6 +612,7 @@ function WallpaperDetailModal({
       const pickedImage = await wallpaperBridge.pickImage();
       if (!pickedImage) {
         setErrorMessage('No image was selected. Please try again.');
+        showToast('No image selected', 'long');
         return;
       }
       const updatedWallpaper: Wallpaper = {
@@ -549,8 +621,10 @@ function WallpaperDetailModal({
       };
       onWallpaperUpdated(updatedWallpaper);
       setImageError(false);
+      showToast('Image selected');
     } catch {
       setErrorMessage('The selected image could not be read. Please choose another image.');
+      showToast('Could not read that image', 'long');
     }
   }, [wallpaper, onWallpaperUpdated]);
 
@@ -569,6 +643,16 @@ function WallpaperDetailModal({
           )}
 
           {/* Preview */}
+          <View style={styles.previewStage}>
+            <View style={styles.previewBadge} pointerEvents="none">
+              <Text style={styles.previewBadgeText}>
+                {wallpaper.kind === 'video' ||
+                wallpaper.kind === 'battery' ||
+                wallpaper.kind === 'pixel'
+                  ? 'LIVE PREVIEW'
+                  : 'PREVIEW'}
+              </Text>
+            </View>
           {wallpaper.kind === 'static' && wallpaper.imageUri && !imageError ? (
             <Image
               key={wallpaper.id}
@@ -583,19 +667,49 @@ function WallpaperDetailModal({
               <Text style={styles.videoErrorHint}>Try selecting another image</Text>
             </View>
           ) : wallpaper.kind === 'video' && !videoError ? (
-            <Video
-              key={wallpaper.id}
-              source={resolveVideoPreviewSource(wallpaper, preparedUri)}
-              style={[styles.videoPreview, previewRotationStyle]}
-              resizeMode="cover"
-              viewType={ViewType.TEXTURE}
-              repeat={wallpaper.loop !== false}
-              paused={false}
-              muted={!wallpaper.audio}
-              playInBackground={true}
-              playWhenInactive={false}
-              onError={() => setVideoError(true)}
-            />
+            <View style={styles.videoPreviewWrap}>
+              {/*
+                Ordering matters: react-native-video's TEXTURE view renders an
+                opaque green frame until it presents the first real frame. Keep
+                the static poster on top while the video is still loading so the
+                green is never visible, then move the video on top to reveal the
+                live preview only once it is ready. For play-once, settle back on
+                the poster when the clip ends.
+              */}
+              {videoLoaded && wallpaper.poster && (
+                <Image
+                  source={wallpaper.poster}
+                  resizeMode="cover"
+                  resizeMethod="resize"
+                  style={styles.videoPreviewAbs as StyleProp<ImageStyle>}
+                />
+              )}
+              <Video
+                key={wallpaper.id}
+                source={resolveVideoPreviewSource(wallpaper, preparedUri)}
+                style={[styles.videoPreviewAbs, previewRotationStyle]}
+                resizeMode="cover"
+                viewType={ViewType.TEXTURE}
+                repeat={wallpaper.loop !== false}
+                muted={!wallpaper.audio}
+                playInBackground={true}
+                playWhenInactive={false}
+                onLoad={() => setVideoLoaded(true)}
+                onError={() => setVideoError(true)}
+                onEnd={() => {
+                  if (wallpaper.loop !== false) return;
+                  setVideoLoaded(false);
+                }}
+              />
+              {!videoLoaded && wallpaper.poster && (
+                <Image
+                  source={wallpaper.poster}
+                  resizeMode="cover"
+                  resizeMethod="resize"
+                  style={styles.videoPreviewAbs as StyleProp<ImageStyle>}
+                />
+              )}
+            </View>
           ) : wallpaper.kind === 'video' && wallpaper.poster ? (
             <Image
               source={wallpaper.poster}
@@ -610,9 +724,21 @@ function WallpaperDetailModal({
                 Try selecting an MP4 or H.264 video
               </Text>
             </View>
+          ) : wallpaper.kind === 'battery' ? (
+            <View style={styles.preview}>
+              <BatteryFluidPreview
+                level={batteryInfo?.level ?? 50}
+                charging={batteryInfo?.charging ?? false}
+              />
+            </View>
+          ) : wallpaper.kind === 'pixel' ? (
+            <View style={styles.preview}>
+              <PixelArtPreview />
+            </View>
           ) : (
             <AnimatedPreview accent={wallpaper.accent} />
           )}
+          </View>
 
           <Text style={styles.modalTitle}>{wallpaper.title}</Text>
           <Text style={styles.modalSubtitle}>{wallpaper.description}</Text>
@@ -686,12 +812,29 @@ function WallpaperDetailModal({
             </>
           )}
 
-          {wallpaper.kind === 'video' && !livePickerAvailable && (
-            <Text style={styles.unsupportedHint}>
-              This device has no live wallpaper picker, so live videos cannot be applied. Use a
-              static wallpaper instead.
+          {wallpaper.kind === 'battery' && (
+            <Text style={styles.staticHint}>
+              Animated green fluid fills to your real battery level, changes color as it drains,
+              surges to full while charging, and sways as you tilt your phone.
             </Text>
           )}
+
+          {wallpaper.kind === 'pixel' && (
+            <Text style={styles.staticHint}>
+              Animated 8-bit pixel art. Neon blocks flow through electric pink, cyan and violet as
+              color waves sweep the screen.
+            </Text>
+          )}
+
+          {(wallpaper.kind === 'video' ||
+            wallpaper.kind === 'battery' ||
+            wallpaper.kind === 'pixel') &&
+            !livePickerAvailable && (
+              <Text style={styles.unsupportedHint}>
+                This device has no live wallpaper picker, so live wallpapers cannot be applied.
+                Use a static wallpaper instead.
+              </Text>
+            )}
           <Text style={styles.previewOnlyLabel}>
             Preview only. Choose a destination below to apply.
           </Text>
@@ -865,6 +1008,30 @@ function WallpaperMedia({
       </View>
     );
   }
+  if (wallpaper.kind === 'battery') {
+    return (
+      <View
+        style={[
+          style,
+          styles.doodleFallback,
+          { alignItems: 'center', justifyContent: 'center' },
+        ]}>
+        <BatteryFluidPreview level={65} charging={false} compact />
+      </View>
+    );
+  }
+  if (wallpaper.kind === 'pixel') {
+    return (
+      <View
+        style={[
+          style,
+          styles.doodleFallback,
+          { alignItems: 'center', justifyContent: 'center' },
+        ]}>
+        <PixelArtPreview compact />
+      </View>
+    );
+  }
   return <LiveThumb key={wallpaper.id} wallpaper={wallpaper} style={style} autoPlay={autoPlay} />;
 }
 
@@ -873,6 +1040,7 @@ function WallpaperMedia({
 const BILLBOARD_INTERVAL_MS = 5000;
 const BILLBOARD_CARD_HEIGHT = 176;
 const BOARD_OVERSCAN = 300;
+const BILLBOARD_MAX = 10;
 
 type BillboardProps = {
   wallpapers: Wallpaper[];
@@ -960,7 +1128,7 @@ function Billboard({ wallpapers, onSelect, scrollY, viewportHeight, active = tru
 
 // ─── Media Grid (FlatList rows) ───────────────────────────────────────────
 
-type Section = 'live' | 'static';
+type Section = 'live' | 'dynamic' | 'static';
 
 type GridRow =
   | { key: string; $rowType: 'billboard' }
@@ -986,7 +1154,23 @@ function WallpaperCard({
       onPress={() => onSelect(wallpaper)}
       style={styles.gridItem}>
       <View style={styles.gridArt}>
-        {wallpaper.kind === 'static' ? (
+        {wallpaper.kind === 'battery' ? (
+          <View
+            style={[
+              styles.gridMedia,
+              { alignItems: 'center', justifyContent: 'center', backgroundColor: '#060A10' },
+            ]}>
+            <BatteryFluidPreview level={60} charging={false} compact />
+          </View>
+        ) : wallpaper.kind === 'pixel' ? (
+          <View
+            style={[
+              styles.gridMedia,
+              { alignItems: 'center', justifyContent: 'center', backgroundColor: '#060A10' },
+            ]}>
+            <PixelArtPreview compact />
+          </View>
+        ) : wallpaper.kind === 'static' ? (
           <Image
             source={wallpaper.source ?? (wallpaper.imageUri ? { uri: wallpaper.imageUri } : undefined)}
             resizeMode="cover"
@@ -1007,7 +1191,13 @@ function WallpaperCard({
         )}
         <View style={styles.gridKindChip}>
           <Text style={styles.gridKindText}>
-            {wallpaper.kind === 'video' ? 'LIVE' : wallpaper.kind === 'static' ? 'STATIC' : 'DOODLE'}
+            {wallpaper.kind === 'video'
+              ? 'LIVE'
+              : wallpaper.kind === 'battery' || wallpaper.kind === 'pixel'
+                ? 'DYNAMIC'
+                : wallpaper.kind === 'static'
+                  ? 'STATIC'
+                  : 'DOODLE'}
           </Text>
         </View>
       </View>
@@ -1022,6 +1212,7 @@ function WallpaperCard({
 function buildGridRows(
   section: Section,
   liveItems: Wallpaper[],
+  dynamicItems: Wallpaper[],
   staticItems: Wallpaper[],
 ): GridRow[] {
   const rows: GridRow[] = [{ key: 'billboard', $rowType: 'billboard' }];
@@ -1034,6 +1225,8 @@ function buildGridRows(
   };
   if (section === 'live') {
     pushSection('Live wallpapers', liveItems);
+  } else if (section === 'dynamic') {
+    pushSection('Dynamic wallpapers', dynamicItems);
   } else {
     pushSection('Static wallpapers', staticItems);
   }
@@ -1044,6 +1237,7 @@ function buildGridRows(
 
 const SECTION_TABS: { key: Section; label: string }[] = [
   { key: 'live', label: 'Live' },
+  { key: 'dynamic', label: 'Dynamic' },
   { key: 'static', label: 'Static' },
 ];
 
@@ -1051,18 +1245,25 @@ function SectionTabs({
   section,
   onChange,
   liveCount,
+  dynamicCount,
   staticCount,
 }: {
   section: Section;
   onChange: (section: Section) => void;
   liveCount: number;
+  dynamicCount: number;
   staticCount: number;
 }) {
   return (
     <View style={styles.tabBar}>
       {SECTION_TABS.map(tab => {
         const active = tab.key === section;
-        const count = tab.key === 'live' ? liveCount : staticCount;
+        const count =
+          tab.key === 'live'
+            ? liveCount
+            : tab.key === 'dynamic'
+              ? dynamicCount
+              : staticCount;
         return (
           <Pressable
             key={tab.key}
@@ -1096,9 +1297,47 @@ function App() {
   const [scrollY, setScrollY] = React.useState(0);
   const [viewportHeight, setViewportHeight] = React.useState(0);
   const [capabilities, setCapabilities] = React.useState<WallpaperCapabilities | null>(null);
+  const [pendingApplyId, setPendingApplyId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     startLogCapture();
+  }, []);
+
+  // Resolve a pending live wallpaper apply once the app returns to the
+  // foreground after the system wallpaper picker closes. Native code decides
+  // whether the wallpaper was actually confirmed; if not, it resets any preview
+  // so a cancelled/previewed wallpaper never sticks as the set wallpaper.
+  const pendingApplyRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    pendingApplyRef.current = pendingApplyId;
+  }, [pendingApplyId]);
+
+  const wallpapersRef = React.useRef(wallpapers);
+  React.useEffect(() => {
+    wallpapersRef.current = wallpapers;
+  }, [wallpapers]);
+
+  React.useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      const pendingId = pendingApplyRef.current;
+      if (state !== 'active' || pendingId == null) return;
+      wallpaperBridge.resolvePendingApply().then(committed => {
+        if (committed) {
+          const name =
+            wallpapersRef.current.find(item => item.id === pendingId)?.title ?? 'Wallpaper';
+          showToast(`✓ "${name}" applied`);
+          setWallpapers(current =>
+            current.map(item =>
+              item.id === pendingId
+                ? { ...item, status: 'Applied' as const }
+                : item,
+            ),
+          );
+        }
+        setPendingApplyId(null);
+      });
+    });
+    return () => subscription.remove();
   }, []);
 
   React.useEffect(() => {
@@ -1121,7 +1360,11 @@ function App() {
   const livePickerUnavailable = capabilities != null && !capabilities.liveWallpaperPickerAvailable;
 
   const liveItems = React.useMemo(
-    () => wallpapers.filter(item => item.kind !== 'static'),
+    () => wallpapers.filter(item => item.kind === 'video' || item.kind === 'doodle'),
+    [wallpapers],
+  );
+  const dynamicItems = React.useMemo(
+    () => wallpapers.filter(item => item.kind === 'battery' || item.kind === 'pixel'),
     [wallpapers],
   );
   const staticItems = React.useMemo(
@@ -1130,8 +1373,8 @@ function App() {
   );
 
   const rows = React.useMemo(
-    () => buildGridRows(section, liveItems, staticItems),
-    [section, liveItems, staticItems],
+    () => buildGridRows(section, liveItems, dynamicItems, staticItems),
+    [section, liveItems, dynamicItems, staticItems],
   );
 
   const handleScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -1146,6 +1389,7 @@ function App() {
     setWallpapers(current => [newWallpaper, ...current]);
     setSelectedWallpaper(newWallpaper);
     setIsCreating(false);
+    showToast(`Created "${newWallpaper.title}"`);
   }, []);
 
   const handleApplied = React.useCallback((id: string) => {
@@ -1155,6 +1399,10 @@ function App() {
         status: item.id === id ? ('Applied' as const) : item.status,
       })),
     );
+  }, []);
+
+  const handlePickerOpened = React.useCallback((id: string) => {
+    setPendingApplyId(id);
   }, []);
 
   const handleWallpaperUpdated = React.useCallback((updated: Wallpaper) => {
@@ -1167,9 +1415,16 @@ function App() {
   const renderRow = React.useCallback(
     ({ item }: { item: GridRow }) => {
       if (item.$rowType === 'billboard') {
+        const billboardItems = (
+          section === 'live'
+            ? liveItems
+            : section === 'dynamic'
+              ? dynamicItems
+              : staticItems
+        ).slice(0, BILLBOARD_MAX);
         return (
           <Billboard
-            wallpapers={section === 'live' ? liveItems : staticItems}
+            wallpapers={billboardItems}
             onSelect={setSelectedWallpaper}
             scrollY={scrollY}
             viewportHeight={viewportHeight}
@@ -1193,7 +1448,7 @@ function App() {
         </View>
       );
     },
-    [section, liveItems, staticItems, scrollY, viewportHeight, selectedWallpaper],
+    [section, liveItems, dynamicItems, staticItems, scrollY, viewportHeight, selectedWallpaper],
   );
 
   return (
@@ -1240,6 +1495,7 @@ function App() {
                   section={section}
                   onChange={setSection}
                   liveCount={liveItems.length}
+                  dynamicCount={dynamicItems.length}
                   staticCount={staticItems.length}
                 />
                 {livePickerUnavailable && section === 'live' && (
@@ -1271,586 +1527,11 @@ function App() {
         onClose={() => setSelectedWallpaper(null)}
         onApplied={handleApplied}
         onWallpaperUpdated={handleWallpaperUpdated}
+        onPickerOpened={handlePickerOpened}
         livePickerAvailable={capabilities?.liveWallpaperPickerAvailable ?? true}
       />
     </ErrorBoundary>
   );
 }
-
-// ─── Styles ──────────────────────────────────────────────────────────────
-
-const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#050E23',
-  },
-  scroll: {
-    flex: 1,
-    backgroundColor: '#050E23',
-  },
-  content: {
-    paddingHorizontal: 18,
-    paddingTop: 14,
-    paddingBottom: 36,
-  },
-  header: {
-    paddingBottom: 16,
-  },
-  tabBar: {
-    flexDirection: 'row',
-    gap: 10,
-    marginTop: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    borderRadius: 14,
-    padding: 4,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.1)',
-  },
-  tabButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    borderRadius: 10,
-    paddingVertical: 10,
-  },
-  tabButtonActive: {
-    backgroundColor: 'rgba(34, 211, 238, 0.18)',
-  },
-  tabLabel: {
-    color: 'rgba(240, 248, 255, 0.6)',
-    fontSize: 15,
-    fontWeight: '800',
-  },
-  tabLabelActive: {
-    color: '#22D3EE',
-  },
-  tabCountPill: {
-    minWidth: 22,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 8,
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    alignItems: 'center',
-  },
-  tabCountPillActive: {
-    backgroundColor: 'rgba(34, 211, 238, 0.25)',
-  },
-  tabCountText: {
-    color: 'rgba(240, 248, 255, 0.6)',
-    fontSize: 11,
-    fontWeight: '800',
-  },
-  tabCountTextActive: {
-    color: '#22D3EE',
-  },
-  unsupportedBanner: {
-    marginTop: 14,
-    backgroundColor: 'rgba(245, 158, 11, 0.12)',
-    borderWidth: 1,
-    borderColor: 'rgba(245, 158, 11, 0.4)',
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
-  unsupportedBannerTitle: {
-    color: '#FCD34D',
-    fontSize: 13,
-    fontWeight: '800',
-    marginBottom: 4,
-  },
-  unsupportedBannerText: {
-    color: 'rgba(253, 230, 138, 0.85)',
-    fontSize: 12,
-    lineHeight: 18,
-  },
-  unsupportedHint: {
-    color: '#FCD34D',
-    fontSize: 12,
-    fontWeight: '600',
-    marginBottom: 14,
-  },
-  brandRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  brandIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 12,
-    marginRight: 12,
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
-  },
-  brandText: {
-    flex: 1,
-  },
-  title: {
-    color: '#F0F8FF',
-    fontSize: 24,
-    fontWeight: '800',
-    letterSpacing: -0.4,
-    marginBottom: 3,
-  },
-  subtitle: {
-    color: 'rgba(240, 248, 255, 0.78)',
-    fontSize: 13,
-    lineHeight: 19,
-  },
-  billboardSection: {
-    marginBottom: 22,
-  },
-  billboardCard: {
-    height: 176,
-    borderRadius: 22,
-    overflow: 'hidden',
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.12)',
-  },
-  billboardArt: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-  },
-  billboardMedia: {
-    width: '100%',
-    height: '100%',
-  },
-  billboardScrim: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    backgroundColor: 'rgba(3, 8, 26, 0.5)',
-  },
-  billboardInfo: {
-    position: 'absolute',
-    left: 16,
-    right: 16,
-    bottom: 14,
-  },
-  billboardKindChip: {
-    alignSelf: 'flex-start',
-    backgroundColor: 'rgba(255, 255, 255, 0.16)',
-    borderRadius: 6,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    marginBottom: 8,
-  },
-  billboardKindText: {
-    color: '#FFFFFF',
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 1,
-  },
-  billboardName: {
-    color: '#FFFFFF',
-    fontSize: 22,
-    fontWeight: '800',
-    textShadowColor: 'rgba(0,0,0,0.4)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-    marginBottom: 4,
-  },
-  billboardDesc: {
-    color: 'rgba(240, 248, 255, 0.85)',
-    fontSize: 13,
-    lineHeight: 18,
-    textShadowColor: 'rgba(0,0,0,0.35)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 3,
-  },
-  dotsRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    marginTop: 10,
-    gap: 6,
-  },
-  dot: {
-    width: 7,
-    height: 7,
-    borderRadius: 3.5,
-    backgroundColor: 'rgba(255, 255, 255, 0.28)',
-  },
-  dotActive: {
-    backgroundColor: '#22D3EE',
-    width: 18,
-  },
-  sectionHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  section: {
-    marginBottom: 30,
-  },
-  sectionTitle: {
-    color: '#F0F8FF',
-    fontSize: 20,
-    fontWeight: '700',
-  },
-  sectionCount: {
-    color: 'rgba(230, 240, 250, 0.55)',
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  gridRow: {
-    flexDirection: 'row',
-    gap: 14,
-    marginBottom: 14,
-  },
-  gridItem: {
-    flex: 1,
-    minWidth: 0,
-  },
-  gridArt: {
-    width: '100%',
-    height: 132,
-    borderRadius: 16,
-    overflow: 'hidden',
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-  },
-  gridMedia: {
-    width: '100%',
-    height: '100%',
-  },
-  videoPlaceholder: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
-  },
-  doodleFallback: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.04)',
-  },
-  gridKindChip: {
-    position: 'absolute',
-    top: 8,
-    right: 8,
-    backgroundColor: 'rgba(2, 8, 23, 0.55)',
-    borderRadius: 6,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-  },
-  gridKindText: {
-    color: '#FFFFFF',
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 0.8,
-  },
-  gridName: {
-    color: '#F0F8FF',
-    fontSize: 15,
-    fontWeight: '700',
-    marginTop: 10,
-    marginBottom: 2,
-  },
-  gridMeta: {
-    color: 'rgba(230, 240, 250, 0.6)',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  wrapper: {
-    flex: 1,
-  },
-  createFab: {
-    position: 'absolute',
-    right: 20,
-    bottom: 32,
-    width: 72,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: '#22D3EE',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#22D3EE',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.45,
-    shadowRadius: 14,
-    elevation: 10,
-    zIndex: 20,
-  },
-  createFabText: {
-    color: '#052033',
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 0.3,
-    textAlign: 'center',
-  },
-  modalBackdrop: {
-    flex: 1,
-    justifyContent: 'flex-end',
-    backgroundColor: 'rgba(2, 8, 23, 0.72)',
-  },
-  modalPanel: {
-    backgroundColor: '#0B1526',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    padding: 22,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.16)',
-  },
-  modalTitle: {
-    color: '#F0F8FF',
-    fontSize: 24,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  modalSubtitle: {
-    color: 'rgba(240, 248, 255, 0.82)',
-    fontSize: 14,
-    lineHeight: 21,
-    marginBottom: 18,
-  },
-  input: {
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.15)',
-    borderRadius: 12,
-    color: '#F0F8FF',
-    paddingHorizontal: 14,
-    paddingVertical: 13,
-    fontSize: 15,
-    marginBottom: 14,
-  },
-  kindRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 18,
-  },
-  kindButton: {
-    flex: 1,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.15)',
-    borderRadius: 10,
-    paddingVertical: 12,
-  },
-  kindButtonSelected: {
-    backgroundColor: 'rgba(34, 211, 238, 0.18)',
-    borderColor: '#22D3EE',
-  },
-  kindButtonDisabled: {
-    opacity: 0.5,
-  },
-  kindButtonText: {
-    color: '#E2E8F0',
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  modalActions: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  modalButton: {
-    flex: 1,
-    minWidth: 0,
-  },
-  preview: {
-    height: 150,
-    borderRadius: 16,
-    marginBottom: 18,
-    overflow: 'hidden',
-    justifyContent: 'flex-end',
-    padding: 16,
-  },
-  videoPreview: {
-    width: '100%',
-    height: 220,
-    borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    marginBottom: 18,
-  },
-  previewOrb: {
-    position: 'absolute',
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-    backgroundColor: 'rgba(255,255,255,0.25)',
-    top: 15,
-    left: '35%',
-  },
-  previewLabel: {
-    color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 1,
-  },
-  videoErrorHint: {
-    color: '#C7D2FE',
-    fontSize: 11,
-    fontWeight: '600',
-    marginTop: 4,
-  },
-  destinationLabel: {
-    color: '#F0F8FF',
-    fontSize: 13,
-    fontWeight: '700',
-    letterSpacing: 0.2,
-    marginBottom: 8,
-  },
-  previewOnlyLabel: {
-    color: '#E0FFFF',
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 14,
-  },
-  loopRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginVertical: 14,
-  },
-  checkbox: {
-    width: 20,
-    height: 20,
-    borderRadius: 5,
-    borderWidth: 1,
-    borderColor: '#64748B',
-    marginRight: 10,
-  },
-  checkboxChecked: {
-    backgroundColor: '#22D3EE',
-    borderColor: '#22D3EE',
-  },
-  loopText: {
-    color: '#E2E8F0',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  durationLabel: {
-    color: '#E0FFFF',
-    fontSize: 13,
-    fontWeight: '700',
-    marginTop: 14,
-    marginBottom: 8,
-  },
-  sliderTrack: {
-    height: 22,
-    backgroundColor: 'rgba(255, 255, 255, 0.08)',
-    borderRadius: 11,
-    justifyContent: 'center',
-    marginBottom: 4,
-  },
-  sliderFill: {
-    height: 22,
-    backgroundColor: '#0E7490',
-    borderRadius: 11,
-  },
-  sliderThumb: {
-    position: 'absolute',
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    backgroundColor: '#A5F3FC',
-    borderWidth: 3,
-    borderColor: '#083344',
-  },
-  rotationRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 14,
-  },
-  rotationButton: {
-    flex: 1,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.15)',
-    borderRadius: 10,
-    paddingVertical: 10,
-  },
-  rotationButtonSelected: {
-    backgroundColor: 'rgba(34, 211, 238, 0.18)',
-    borderColor: '#22D3EE',
-  },
-  rotationButtonText: {
-    color: '#E2E8F0',
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  rotationHint: {
-    color: 'rgba(224, 255, 255, 0.75)',
-    fontSize: 12,
-    fontWeight: '600',
-    marginBottom: 6,
-  },
-  staticImagePreview: {
-    width: '100%',
-    height: 220,
-    borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    marginTop: 14,
-    marginBottom: 14,
-  },
-  staticHint: {
-    color: 'rgba(230, 240, 250, 0.65)',
-    fontSize: 12,
-    fontWeight: '600',
-    marginTop: 2,
-    marginBottom: 20,
-    lineHeight: 18,
-  },
-  errorText: {
-    color: '#FDA4AF',
-    fontSize: 13,
-    fontWeight: '700',
-    marginTop: 14,
-    flexShrink: 1,
-  },
-  errorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    marginTop: 14,
-  },
-  loadingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(15, 23, 42, 0.85)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 10,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-  },
-  loadingText: {
-    color: '#E0FFFF',
-    fontSize: 14,
-    fontWeight: '700',
-    marginTop: 14,
-  },
-  errorBoundary: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-    backgroundColor: '#050E23',
-  },
-  errorBoundaryTitle: {
-    color: '#F0F8FF',
-    fontSize: 24,
-    fontWeight: '800',
-    marginBottom: 12,
-  },
-  errorBoundaryMessage: {
-    color: '#FDA4AF',
-    fontSize: 14,
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 20,
-  },
-  errorBoundaryActions: {
-    marginTop: 12,
-    alignSelf: 'stretch',
-  },
-});
 
 export default App;

@@ -1,5 +1,6 @@
 import React from 'react';
-import { StyleSheet, View } from 'react-native';
+import { View } from 'react-native';
+import { styles } from '../styles';
 
 /**
  * Color helpers for the abstract art: convert a hex accent into a small
@@ -67,15 +68,15 @@ export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
 
   return (
     <View
-      style={[styles.art, { width: size, height: size, backgroundColor: paper }]}>
+      style={[styles.gaArt, { width: size, height: size, backgroundColor: paper }]}>
       {/* soft glow blobs */}
-      <View style={[styles.blob, { width: size * 0.9, height: size * 0.9, borderRadius: size * 0.45, backgroundColor: rgba(accent, 0.28), top: -size * 0.35, left: -size * 0.2 }]} />
-      <View style={[styles.blob, { width: size * 0.7, height: size * 0.7, borderRadius: size * 0.35, backgroundColor: rgba(accent, 0.22), bottom: -size * 0.25, right: -size * 0.15 }]} />
+      <View style={[styles.gaBlob, { width: size * 0.9, height: size * 0.9, borderRadius: size * 0.45, backgroundColor: rgba(accent, 0.28), top: -size * 0.35, left: -size * 0.2 }]} />
+      <View style={[styles.gaBlob, { width: size * 0.7, height: size * 0.7, borderRadius: size * 0.35, backgroundColor: rgba(accent, 0.22), bottom: -size * 0.25, right: -size * 0.15 }]} />
 
       {/* accent ring */}
       <View
         style={[
-          styles.ring,
+          styles.gaRing,
           {
             width: ring,
             height: ring,
@@ -91,8 +92,8 @@ export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
       {/* white diamond */}
       <View
         style={[
-          styles.diamond,
-          styles.diamondShine,
+          styles.gaDiamond,
+          styles.gaDiamondShine,
           {
             width: diamond,
             height: diamond,
@@ -105,7 +106,7 @@ export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
       {/* deep orb */}
       <View
         style={[
-          styles.orb,
+          styles.gaOrb,
           {
             width: orb,
             height: orb,
@@ -120,7 +121,7 @@ export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
       {/* triangle */}
       <View
         style={[
-          styles.triangle,
+          styles.gaTriangle,
           {
             borderBottomWidth: size * 0.2,
             borderLeftWidth: size * 0.13,
@@ -133,42 +134,8 @@ export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
       />
 
       {/* dots */}
-      <View style={[styles.dot, { width: dot, height: dot, borderRadius: dot / 2, backgroundColor: light, left: size * 0.16, bottom: size * 0.16 }]} />
-      <View style={[styles.dot, { width: dot * 0.7, height: dot * 0.7, borderRadius: size * 0.035, backgroundColor: rgba(accent, 0.9), right: size * 0.2, top: size * 0.1 }]} />
+      <View style={[styles.gaDot, { width: dot, height: dot, borderRadius: dot / 2, backgroundColor: light, left: size * 0.16, bottom: size * 0.16 }]} />
+      <View style={[styles.gaDot, { width: dot * 0.7, height: dot * 0.7, borderRadius: size * 0.035, backgroundColor: rgba(accent, 0.9), right: size * 0.2, top: size * 0.1 }]} />
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  art: {
-    overflow: 'hidden',
-  },
-  blob: {
-    position: 'absolute',
-  },
-  ring: {
-    position: 'absolute',
-    backgroundColor: 'transparent',
-  },
-  diamond: {
-    position: 'absolute',
-    transform: [{ rotate: '45deg' }],
-  },
-  diamondShine: {
-    backgroundColor: 'rgba(255, 255, 255, 0.38)',
-  },
-  orb: {
-    position: 'absolute',
-  },
-  triangle: {
-    position: 'absolute',
-    width: 0,
-    height: 0,
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
-    backgroundColor: 'transparent',
-  },
-  dot: {
-    position: 'absolute',
-  },
-});

@@ -69,7 +69,7 @@ The wallpaper service receives an app-owned file that remains readable after the
   - Uses an animated accent indicator.
 
 - `src/types.ts`
-  - `WallpaperKind`: `doodle | video`.
+  - `WallpaperKind`: `doodle | video | static`.
   - `Wallpaper`: UI/library model; optional video URI, loop, audio, and playback duration fields.
   - `PickedVideo`: `{ uri, durationSeconds }`.
   - `WallpaperCapabilities`, `WallpaperApplyResult`, and `WallpaperError` contracts.
@@ -137,7 +137,7 @@ The wallpaper service receives an app-owned file that remains readable after the
 `WallpaperModule.saveWallpaperConfig()` writes these keys to `SharedPreferences("wallpaper_pref", 0)`:
 
 - `W_ID`: wallpaper ID
-- `W_KIND`: `doodle` or `video`
+- `W_KIND`: `doodle`, `video`, or `static` (static is used by both image-picked and AI-generated wallpapers)
 - `W_PATH`: video URI; currently an app-private `file://` URI for selected videos
 - `W_LOOP`: boolean loop setting
 - `W_DURATION`: playback duration clamped from 1 to 30 seconds
@@ -276,3 +276,21 @@ The Android compile currently passes. The React Native Jest render test currentl
 - App display name updated to `LiveWallpaper Studio` in `app.json` and `android/app/src/main/res/values/strings.xml`.
 - The Jest render test now asserts `LiveWallpaper Studio` and unmounts the rendered component so the billboard interval is cleared after the test (removes the open-async-handle noise).
 - Removed the unused capabilities/loading skeleton state from `App()` since the home screen no longer shows SDK/native metrics.
+
+## Recent Fixes — Wallpaper Engine Lifecycle (this round)
+
+Targeted fixes for wallpaper-engine lifecycle bugs surfaced from on-device testing of the picker/commit/idle flows:
+
+1. **Config-reload watchdog** (`WallpaperService.kt`): a 1s `configWatchdog` polls the in-memory config signature against the on-disk config (preview vs committed, preferring committed) and calls `reloadConfigurationFromDisk()` to rebuild the player/render when they diverge. Wired into `onSurfaceCreated`, `onVisibilityChanged`, and `onDestroy`. This makes the engine notice config writes made while the picker/confirmation is on top.
+
+2. **Play-once fix** (`WallpaperService.kt`): removed the `seekTo(durationMs)` that ran on every `onVisibilityChanged(true)`. It was jumping fresh one-shot (non-loop) videos straight to `STATE_ENDED` before any frame rendered, which was the root cause of "play once doesn't load in the picker". Now visibility restarts/idles the pipeline correctly for the loop setting.
+
+3. **LOCK-destination detection fix** (`WallpaperModule.kt`): `isOurLiveWallpaperActive()` now checks BOTH home/system (`wallpaperInfo`) AND lock (`getWallpaperInfo(FLAG_LOCK)` via reflection through `wallInfoFor()`). Root cause: dumpsys proved the live wallpaper was set on LOCK (`mWhich=2`, `mBindSource=SET_LIVE`, our component), but the old detection only read home → treated it as a cancel → discarded the preview video → the committed config stayed `doodle` → rendered "Aurora" default doodle. `resolvePendingApply` now commits correctly when the wallpaper is active on either destination.
+
+4. **Idle-stop fix** (`WallpaperService.kt`): `onVisibilityChanged(true)` now calls `restartVideoPipeline()` (release player → reload static → `startExoPlayer(surfaceHolder)` → `refreshRendering()`) whenever `exoPlayer == null || !isPlayerReady`, instead of a bare `play()` on a released player. Root cause: screen-off destroys the surface and releases the player; resuming via visibility alone left the wallpaper frozen.
+
+5. **Direct live-wallpaper apply removed** (`WallpaperModule.kt`): `finishLiveApply` always uses `openWallpaperConfirmation`. `setLiveWallpaperComponentDirectly`/`hasSetWallpaperComponentPermission` are kept only as `@Suppress("unused")` reference helpers, and `getCapabilities` reports `canSetLiveWallpaperDirectly = false`. Direct set is gated by the signature-level `SET_WALLPAPER_COMPONENT` permission inside `system_server` and is not reachable from a normal install.
+
+6. **Doodle entries removed** (`src/data/mockWallpapers.ts`): removed the `doodle-aurora`/`doodle-spark` entries and all four predefined doodles (now an empty array). The runtime catalog `bundledWallpapers.ts` never contained doodles (all `live-*`/`static-*`), and `mockWallpapers.ts` is unused by app code. Only the doodle *entries* were removed; the doodle *capability* (kind, editor option, native renderer, styles) was intentionally kept per user scope choice.
+
+Verification: `tsc --noEmit` clean; Jest passes; no native rebuild/install performed this round (user builds/tests on-device themselves).

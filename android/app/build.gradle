@@ -83,6 +83,14 @@ android {
         }
     }
 
+    lint {
+        // wallInfoFor() uses a hidden WallpaperManager.getWallpaperInfo(int)
+        // via reflection to detect a live wallpaper set on the LOCK screen. It
+        // is wrapped in try/catch and returns null when unavailable, so it can
+        // never crash the app; only warn instead of failing the release build.
+        disable 'BlockedPrivateApi'
+    }
+
     namespace "com.wall_e"
     defaultConfig {
         applicationId "com.wall_e"

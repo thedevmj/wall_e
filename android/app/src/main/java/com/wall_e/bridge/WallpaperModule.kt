@@ -7,10 +7,16 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.ActivityNotFoundException
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
+import java.net.HttpURLConnection
+import java.nio.charset.StandardCharsets
+import org.json.JSONArray
+import org.json.JSONObject
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -178,6 +184,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         private const val VIDEO_REQUEST_CODE = 4107
         private const val IMAGE_REQUEST_CODE = 4108
         private const val TAG = "WallpaperModule"
+        private const val COMMITTED_PREFS = "wallpaper_pref"
+        private const val PREVIEW_PREFS = "wallpaper_preview_pref"
     }
 
     override fun getName(): String = "WallpaperModule"
@@ -196,6 +204,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 pushString("Doodle renderer")
                 pushString("Video preview")
                 pushString("Static image wallpaper")
+                pushString("Animated pixel art wallpaper")
+                pushString("Battery fluid wallpaper")
                 pushString("Video rotation")
                 pushString("Wallpaper picker")
             }
@@ -204,6 +214,10 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 putBoolean("supportsLiveWallpaper", supportsLive)
                 putBoolean("setWallpaperAllowed", setWallpaperAllowed)
                 putBoolean("liveWallpaperPickerAvailable", livePickerAvailable)
+                // Direct live-wallpaper set requires the signature-level
+                // SET_WALLPAPER_COMPONENT permission, which a normal install never
+                // holds, so it is reported as unavailable.
+                putBoolean("canSetLiveWallpaperDirectly", false)
                 putString("device", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
                 putString("androidVersion", Build.VERSION.RELEASE)
                 putInt("minSdk", 24)
@@ -217,6 +231,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 putBoolean("supportsLiveWallpaper", false)
                 putBoolean("setWallpaperAllowed", true)
                 putBoolean("liveWallpaperPickerAvailable", false)
+                putBoolean("canSetLiveWallpaperDirectly", false)
                 putString("device", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
                 putString("androidVersion", Build.VERSION.RELEASE)
                 putInt("minSdk", 24)
@@ -267,7 +282,27 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio, rotation=$rotation")
 
             if (kind == "static") {
-                applyStaticWallpaper(id, videoUri, destination, promise)
+                applyStaticWallpaper(id, videoUri, destination) { ok, error, errorCode ->
+                    postToUi {
+                        val result: WritableMap = Arguments.createMap().apply {
+                            putBoolean("ok", ok)
+                            putString("id", id)
+                            putString("destination", destination)
+                            putString("mode", "static-wallpaper-$destination")
+                            if (error != null) putString("error", error)
+                            if (!ok) putString("errorCode", errorCode)
+                        }
+                        promise.resolve(result)
+                    }
+                }
+                return
+            }
+
+            // The battery fluid wallpaper is fully self-contained (reads battery +
+            // sensors natively) and needs no media URI, rotation, or loop config.
+            // It flows through the same live-wallpaper confirmation path as video.
+            if (kind == "battery" || kind == "pixel") {
+                finishLiveApply(id, kind, destination, "", true, playbackDuration, false, 0, promise)
                 return
             }
 
@@ -327,17 +362,29 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         rotation: Int,
         promise: Promise,
     ) {
-        saveWallpaperConfig(id, kind, mediaUri, loop, playbackDuration, audio, "", rotation)
+        // Write only a *pending* config first; it becomes the committed wallpaper
+        // when the user confirms in the system live wallpaper picker. The
+        // currently set wallpaper is never touched on failure/cancel.
+        //
+        // Direct set (WallpaperManager.setWallpaperComponent) was removed: it is
+        // gated by the signature-level SET_WALLPAPER_COMPONENT permission inside
+        // system_server, which a normal install never holds, and it added a code
+        // path that could leave wallpaper in a half-set state. The auto-targeted
+        // system picker is the reliable path on every Android device.
+        savePreviewConfig(id, kind, mediaUri, loop, playbackDuration, audio, "", rotation)
         val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
+
         val flags = when (destination.uppercase()) {
             "HOME" -> WallpaperManager.FLAG_SYSTEM
             "LOCK" -> WallpaperManager.FLAG_LOCK
             "BOTH" -> WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK
             else -> throw IllegalArgumentException("Unknown wallpaper destination: $destination")
         }
+
         postToUi {
             try {
                 openWallpaperConfirmation(component, flags)
+                Log.i(TAG, "Live wallpaper picker opened for $destination (flags=$flags)")
                 val result: WritableMap = Arguments.createMap().apply {
                     putBoolean("ok", true)
                     putString("id", id)
@@ -356,6 +403,53 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 }
                 promise.resolve(result)
             }
+        }
+    }
+
+    /**
+     * Attempts to set our live wallpaper component directly without the system
+     * picker. Returns true on success.
+     *
+     * setWallpaperComponent(ComponentName) is a hidden @SystemApi whose access is
+     * gated by the signature-level SET_WALLPAPER_COMPONENT permission *inside
+     * system_server*, so reflection cannot bypass it: only installs that are
+     * system/privileged apps (or signed with the platform key) can set a live
+     * wallpaper directly.
+     *
+     * NOTE: no longer called by the apply flow, which always uses the system
+     * picker. Kept only as a reference for system-app builds.
+     */
+    @Suppress("unused")
+    private fun setLiveWallpaperComponentDirectly(component: ComponentName): Boolean {
+        if (!hasSetWallpaperComponentPermission()) {
+            Log.w(TAG, "SET_WALLPAPER_COMPONENT not granted; direct live-wallpaper set unavailable (system-app install required)")
+            return false
+        }
+        return try {
+            val wallpaperManager = WallpaperManager.getInstance(reactContext)
+            val method = wallpaperManager.javaClass
+                .getMethod("setWallpaperComponent", ComponentName::class.java)
+            method.invoke(wallpaperManager, component)
+            Log.i(TAG, "setWallpaperComponent succeeded: $component")
+            true
+        } catch (error: java.lang.reflect.InvocationTargetException) {
+            Log.w(TAG, "setWallpaperComponent rejected by system_server", error.cause ?: error)
+            false
+        } catch (error: SecurityException) {
+            Log.w(TAG, "setWallpaperComponent denied (no SET_WALLPAPER_COMPONENT permission)", error)
+            false
+        } catch (error: Exception) {
+            Log.w(TAG, "setWallpaperComponent failed; falling back to picker", error)
+            false
+        }
+    }
+
+    private fun hasSetWallpaperComponentPermission(): Boolean {
+        return try {
+            reactContext.checkCallingOrSelfPermission("android.permission.SET_WALLPAPER_COMPONENT") ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -378,17 +472,15 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         }
     }
 
-    private fun applyStaticWallpaper(id: String, imageUri: String, destination: String, promise: Promise) {
+    private fun applyStaticWallpaper(
+        id: String,
+        imageUri: String,
+        destination: String,
+        onResult: (ok: Boolean, error: String?, errorCode: String) -> Unit,
+    ) {
         try {
             if (imageUri.isBlank()) {
-                val result: WritableMap = Arguments.createMap().apply {
-                    putBoolean("ok", false)
-                    putString("id", id)
-                    putString("destination", destination)
-                    putString("error", "No image selected")
-                    putString("errorCode", "NO_IMAGE")
-                }
-                promise.resolve(result)
+                onResult(false, "No image selected", "NO_IMAGE")
                 return
             }
 
@@ -405,14 +497,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             inputStream.close()
 
             if (bitmap == null) {
-                val result: WritableMap = Arguments.createMap().apply {
-                    putBoolean("ok", false)
-                    putString("id", id)
-                    putString("destination", destination)
-                    putString("error", "Could not decode the selected image")
-                    putString("errorCode", "IMAGE_DECODE_ERROR")
-                }
-                promise.resolve(result)
+                onResult(false, "Could not decode the selected image", "IMAGE_DECODE_ERROR")
                 return
             }
 
@@ -437,24 +522,33 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             bitmap.recycle()
 
             Log.i(TAG, "Static wallpaper applied: id=$id destination=$destination")
-
+            onResult(true, null, "OK")
+        } catch (error: Exception) {
+            Log.e(TAG, "Failed to apply static wallpaper", error)
+            onResult(false, "Unable to set the static wallpaper: ${error.message}", "STATIC_APPLY_ERROR")
+        }
+    }
+    @ReactMethod
+    fun getBatteryLevel(promise: Promise) {
+        try {
+            // Reading a sticky ACTION_BATTERY_CHANGED with a null receiver does not
+            // register anything, so there is no leak to worry about.
+            val intent = reactContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val percent = if (level >= 0 && scale > 0) (level * 100f / scale).coerceIn(0f, 100f) else 0f
+            val charging =
+                status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
             val result: WritableMap = Arguments.createMap().apply {
-                putBoolean("ok", true)
-                putString("id", id)
-                putString("destination", destination)
-                putString("mode", "static-wallpaper-$destination")
+                putDouble("level", percent.toDouble())
+                putBoolean("charging", charging)
             }
             promise.resolve(result)
         } catch (error: Exception) {
-            Log.e(TAG, "Failed to apply static wallpaper", error)
-            val result: WritableMap = Arguments.createMap().apply {
-                putBoolean("ok", false)
-                putString("id", id)
-                putString("destination", destination)
-                putString("error", "Unable to set the static wallpaper: ${error.message}")
-                putString("errorCode", "STATIC_APPLY_ERROR")
-            }
-            promise.resolve(result)
+            Log.e(TAG, "getBatteryLevel failed", error)
+            promise.reject("BATTERY_ERROR", "Unable to read battery level", error)
         }
     }
 
@@ -585,7 +679,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     private fun saveWallpaperConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String, rotation: Int = 0) {
-        val preferences = reactContext.getSharedPreferences("wallpaper_pref", 0)
+        val preferences = reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
         val finalAccent = if (accent.isNotBlank()) accent else "#7C3AED"
 
         Log.i(TAG, "SAVING CONFIG TO SharedPreferences: kind=$kind, path=$videoUri, rotation=$rotation")
@@ -603,6 +697,163 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
         val check = preferences.getString("W_PATH", "FAILED")
         Log.i(TAG, "VERIFY SAVED PATH: $check")
+    }
+
+    /**
+     * Writes the not-yet-confirmed live wallpaper selection into the preview
+     * store. The live wallpaper service only uses this while it is being shown
+     * in the system wallpaper picker; the committed store is updated only after
+     * the user confirms (see [resolvePendingApply]).
+     */
+    private fun savePreviewConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String, rotation: Int = 0) {
+        val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
+        val finalAccent = if (accent.isNotBlank()) accent else "#7C3AED"
+
+        Log.i(TAG, "SAVING PREVIEW CONFIG: kind=$kind, path=$videoUri, rotation=$rotation")
+
+        preview.edit()
+            .putString("W_ID", id)
+            .putString("W_KIND", kind)
+            .putString("W_PATH", videoUri)
+            .putBoolean("W_LOOP", loop)
+            .putInt("W_DURATION", playbackDuration.coerceIn(1, 30))
+            .putBoolean("W_AUDIO", audio)
+            .putString("W_ACCENT", finalAccent)
+            .putInt("W_ROTATION", rotation.coerceIn(0, 270))
+            .commit()
+
+        // Tag the committed store with the id of the pending live wallpaper so
+        // resolvePendingApply knows there is a selection awaiting confirmation.
+        reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
+            .edit()
+            .putString("W_PREVIEW_ID", id)
+            .putLong("W_PREVIEW_TIME", System.currentTimeMillis())
+            .commit()
+    }
+
+    /**
+     * Resolves a pending live wallpaper apply. Called when the app returns to
+     * the foreground after the system wallpaper picker closes.
+     *
+     * - If our live wallpaper is now the active wallpaper, the pending preview
+     *   is promoted to the committed wallpaper (the user confirmed).
+     * - Otherwise the pending preview is discarded and the previously committed
+     *   wallpaper is left exactly as it was (the user cancelled).
+     *
+     * This is what finally commits a live wallpaper and why cancelling the
+     * picker never leaves a trace behind.
+     */
+    @ReactMethod
+    fun resolvePendingApply(promise: Promise) {
+        try {
+            val committed = reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
+            val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
+            val pendingId = committed.getString("W_PREVIEW_ID", null)
+
+            if (pendingId.isNullOrBlank()) {
+                postToUi {
+                    val result: WritableMap = Arguments.createMap().apply {
+                        putBoolean("committed", false)
+                    }
+                    promise.resolve(result)
+                }
+                return
+            }
+
+            if (isOurLiveWallpaperActive()) {
+                Log.i(TAG, "resolvePendingApply: live wallpaper confirmed, committing $pendingId")
+                // Promote preview -> committed so the settled wallpaper persists.
+                commitPendingToWallpaper()
+                clearPendingApply()
+                postToUi {
+                    val result: WritableMap = Arguments.createMap().apply {
+                        putBoolean("committed", true)
+                        putString("id", pendingId)
+                    }
+                    promise.resolve(result)
+                }
+            } else {
+                Log.i(TAG, "resolvePendingApply: picker cancelled, discarding pending $pendingId")
+                // Discard the preview; the committed wallpaper stays unchanged.
+                preview.edit().clear().commit()
+                clearPendingApply()
+                postToUi {
+                    val result: WritableMap = Arguments.createMap().apply {
+                        putBoolean("committed", false)
+                    }
+                    promise.resolve(result)
+                }
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "resolvePendingApply failed", error)
+            postToUi {
+                promise.resolve(Arguments.createMap().apply { putBoolean("committed", false) })
+            }
+        }
+    }
+
+    /**
+     * True when our live wallpaper component is the currently-set live wallpaper
+     * on the home/system *or* the lock screen.
+     *
+     * This must check both flags. getWallpaperInfo() (public API) only reports
+     * the home/system wallpaper, so a live wallpaper applied only to the LOCK
+     * screen would otherwise be seen as "not ours" and the apply treated as a
+     * cancel. The lock-specific getWallpaperInfo(int which) is hidden, so it is
+     * read reflectively when available and skipped otherwise.
+     */
+    private fun isOurLiveWallpaperActive(): Boolean {
+        val ours = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
+        return try {
+            val wm = reactContext.getSystemService(WallpaperManager::class.java)
+                ?: return false
+            val systemInfo = wm.wallpaperInfo
+            val lockInfo = wallInfoFor(wm, WallpaperManager.FLAG_LOCK)
+            val active =
+                (systemInfo != null && systemInfo.component == ours) ||
+                    (lockInfo != null && lockInfo.component == ours)
+            Log.i(TAG, "isOurLiveWallpaperActive: system=${systemInfo?.component} lock=${lockInfo?.component} -> $active")
+            active
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Reads the (hidden) per-screen WallpaperInfo. Returns null when unavailable. */
+    private fun wallInfoFor(wm: WallpaperManager, which: Int): android.app.WallpaperInfo? {
+        return try {
+            val method = WallpaperManager::class.java
+                .getDeclaredMethod("getWallpaperInfo", Int::class.javaPrimitiveType)
+            method.isAccessible = true
+            method.invoke(wm, which) as? android.app.WallpaperInfo
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun commitPendingToWallpaper() {
+        val committed = reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
+        val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
+        val editor = committed.edit()
+        if (preview.contains("W_ID")) editor.putString("W_ID", preview.getString("W_ID", ""))
+        if (preview.contains("W_KIND")) editor.putString("W_KIND", preview.getString("W_KIND", "doodle"))
+        if (preview.contains("W_PATH")) editor.putString("W_PATH", preview.getString("W_PATH", ""))
+        if (preview.contains("W_LOOP")) editor.putBoolean("W_LOOP", preview.getBoolean("W_LOOP", true))
+        if (preview.contains("W_DURATION")) editor.putInt("W_DURATION", preview.getInt("W_DURATION", 30))
+        if (preview.contains("W_AUDIO")) editor.putBoolean("W_AUDIO", preview.getBoolean("W_AUDIO", false))
+        if (preview.contains("W_ACCENT")) editor.putString("W_ACCENT", preview.getString("W_ACCENT", "#7C3AED"))
+        if (preview.contains("W_ROTATION")) editor.putInt("W_ROTATION", preview.getInt("W_ROTATION", 0))
+        editor.commit()
+        preview.edit().clear().commit()
+        Log.i(TAG, "Committed pending preview to wallpaper: path=${committed.getString("W_PATH", "")}")
+    }
+
+    private fun clearPendingApply() {
+        reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
+            .edit()
+            .remove("W_PREVIEW_ID")
+            .remove("W_PREVIEW_TIME")
+            .commit()
     }
 
     private fun startPickerActivity(intent: Intent) {

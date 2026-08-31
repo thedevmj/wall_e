@@ -643,7 +643,31 @@ export const staticWallpapers: Wallpaper[] = [
   },
 ];
 
+export const dynamicWallpapers: Wallpaper[] = [
+  {
+    id: 'dynamic-battery-fluid',
+    title: 'Battery Fluid',
+    kind: 'battery',
+    description: 'Animated green fluid that fills with your battery level, changes color, and tilts with your phone.',
+    accent: '#22C55E',
+    status: 'Ready',
+    duration: 'Live',
+    createdAt: 'Bundled',
+  },
+  {
+    id: 'dynamic-pixel-art',
+    title: 'Pixel Wave',
+    kind: 'pixel',
+    description: 'Animated 8-bit pixel art. A grid of neon blocks flows through electric pink, cyan and violet as color waves sweep the screen.',
+    accent: '#FF006E',
+    status: 'Ready',
+    duration: 'Live',
+    createdAt: 'Bundled',
+  },
+];
+
 export const bundledWallpapers: Wallpaper[] = [
   ...liveWallpapers,
+  ...dynamicWallpapers,
   ...staticWallpapers,
 ];

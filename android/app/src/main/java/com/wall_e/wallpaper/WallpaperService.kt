@@ -29,6 +29,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
 import java.io.File
+import kotlin.math.cos
 import kotlin.math.sin
 
 class LiveWallpaperService : WallpaperService() {
@@ -202,6 +203,65 @@ class LiveWallpaperService : WallpaperService() {
         // Reusable paint for the pixel-art wallpaper (sharp, no antialiasing so
         // the blocks stay crisp and "retro").
         private val pixelPaint = Paint().apply { style = Paint.Style.FILL }
+        // Pixel wallpaper variant, derived from the configured accent colour.
+        // "calm" = minimalist teal, "synth" = neon synthwave, "aura" = premium
+        // flowing-gradient (Dark Elegant) wallpaper.
+        private var pixelVariant = "synth"
+        private var derivedPixelPalette = intArrayOf(
+            Color.parseColor("#FF006E"),
+            Color.parseColor("#00D9FF"),
+            Color.parseColor("#8338EC"),
+        )
+        // Reusable paint for the aura (flowing gradient) wallpaper. Antialiased and
+        // radial-shader filled circles only — GPU cheap, large soft blobs.
+        private val auraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var auraGradients = arrayOf<android.graphics.RadialGradient?>(null, null, null)
+        private var auraGradientRes = 0
+
+        // Paint/shader/cache fields for the premium aurora wallpaper.
+        private val auroraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var auroraGradient: android.graphics.RadialGradient? = null
+        private val vignettePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var vignetteGradient: android.graphics.RadialGradient? = null
+        private val grainPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private var grainBitmap: android.graphics.Bitmap? = null
+
+        // Paint/shader/cache fields for the premium "membrane" (Crimson Bloom)
+        // wallpaper. Enormous soft surfaces of pink-lavender and deep crimson
+        // over a midnight-navy void, separated by one huge flowing curved boundary.
+        private val membranePath = Path()
+        private val membranePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var membraneGradient: android.graphics.RadialGradient? = null
+
+        // Supernova accents for the membrane wallpaper: a pulsing energetic core
+        // glow plus luminous rays that stream outward. A dedicated ray path and
+        // stroke brush keep per-frame allocations to zero.
+        private val rayPath = Path()
+        private val rayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val corePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var coreGradient: android.graphics.RadialGradient? = null
+
+        // Membrane renderer cache: the palette colours and unit radial gradients
+        // are rebuilt ONLY when the accent hue changes, then positioned each frame
+        // through a single reused matrix. This removes ~6 gradient objects and
+        // ~12 small arrays of per-frame allocation (the previous hot path).
+        private var mbCacheHue: Float = Float.NaN
+        private val mbMatrix = android.graphics.Matrix()
+        private var mbPink: android.graphics.RadialGradient? = null
+        private var mbWine: android.graphics.RadialGradient? = null
+        private var mbIndigo: android.graphics.RadialGradient? = null
+        private var mbBoundary: android.graphics.RadialGradient? = null
+        private var mbCoreGlow: android.graphics.RadialGradient? = null
+        private var mbVignette: android.graphics.RadialGradient? = null
+        private var mbWhiteHot = 0
+        private var mbPaleHot = 0
+        private var mbHotViolet = 0
+        private var mbRayInner = 0
+        private var mbRayHalo = 0
+
         private var fluidGradientRes = 0 // pixel height the cached gradient was built for
         private val batteryReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -1021,7 +1081,7 @@ class LiveWallpaperService : WallpaperService() {
                 }
                 val drawWithCanvas = synchronized(playerLock) {
                     wallpaperKind == "battery" ||
-                        wallpaperKind == "pixel" ||
+                        wallpaperKind == "membrane" ||
                         wallpaperKind == "static" ||
                         wallpaperKind == "doodle" ||
                         (wallpaperKind == "video" &&
@@ -1038,7 +1098,7 @@ class LiveWallpaperService : WallpaperService() {
                             // -> seconds). It is monotonic and frame-locked, so the motion
                             // glides smoothly with no accumulated-drift jitter.
                             val animSeconds =
-                                if (wallpaperKind == "battery" || wallpaperKind == "pixel")
+                                if (wallpaperKind == "battery" || wallpaperKind == "membrane")
                                     frameTimeNanos / 1e9f
                                 else fluidAnimTimeSec
                             drawFrame(canvas, animSeconds)
@@ -1088,11 +1148,23 @@ class LiveWallpaperService : WallpaperService() {
 
             val fillTop = h - h * fluidDisplayLevel
 
-            val hueBase = (fluidDisplayLevel * 120f).coerceIn(0f, 120f)
-            val sat = 0.75f
+            // Map the fluid colour to battery "health" across a full spectrum so the
+            // level is readable at a glance: red/orange near empty, green in the
+            // healthy mid-range, and a fresh cyan-blue near full. The chosen accent
+            // seeds the hue family so the custom-colour picker still lands.
+            val accentHsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, accentHsv)
+
+            // Build a health ramp in an HSV hue space centred around the accent hue:
+            //   level 0   → hue -110° (roughly red/orange, urgent)
+            //   level 50% → hue +0°  (the accent / healthy mid)
+            //   level 100%→ hue +85° (fresh cyan-blue, full)
+            // Wrapped into [0,360). Saturation is kept high, and only the hue moves.
+            val rampHue = (accentHsv[0] - 110f + 240f * (fluidDisplayLevel.coerceIn(0f, 1f))).let { ((it % 360f) + 360f) % 360f }
+            val sat = maxOf(0.65f, accentHsv[1])
             val value = if (batteryIsCharging) 0.98f else 0.82f
-            val surfaceColor = Color.HSVToColor(floatArrayOf(hueBase, sat, value))
-            val deepColor = Color.HSVToColor(floatArrayOf(hueBase, 0.9f, value * 0.4f))
+            val surfaceColor = Color.HSVToColor(floatArrayOf(rampHue, sat, value))
+            val deepColor = Color.HSVToColor(floatArrayOf(rampHue, 0.9f, value * 0.4f))
 
             if (h.toInt() != fluidGradientRes) {
                 fluidGradientRes = h.toInt()
@@ -1142,36 +1214,77 @@ class LiveWallpaperService : WallpaperService() {
         }
 
         /**
-         * Renders the animated pixel-art wallpaper. A coarse grid of rounded-free
-         * (sharp) pixel blocks, each chromatically flowing between the four brand
-         * colors while a travelling wave sweeps across the screen. A soft per-cell
-         * opacity pulse keeps it hypnotic but cheap: pure drawRect fills, no
-         * shaders, allocations, or antialiasing — smooth even on low-end GPUs.
+         * Renders the animated pixel-art wallpaper. Variants are chosen by the
+         * configured accent colour:
+         *  - calm (teal accent): minimalist symmetric grid, slowly flowing teal /
+         *    ocean / navy blocks on dark navy — peaceful and meditative.
+         *  - synth (pink accent): denser neon grid on pure black with vivid pink /
+         *    cyan / violet colour-shifting blocks — retro-futuristic and hypnotic.
+         *  - aura (deep-purple accent): premium flowing-gradient wallpaper — a few
+         *    large soft radial-gradient orbs drifting and colour-blending over a
+         *    dark charcoal background (see drawAura).
+         * The pixel grids are pure drawRect fills (no shaders, allocations or
+         * antialiasing) so they stay smooth even on low-end GPUs.
          */
         private fun drawPixelArt(canvas: Canvas, elapsed: Float) {
+            if (pixelVariant == "aura") {
+                drawAura(canvas, elapsed)
+                return
+            }
+
             val w = canvas.width.toFloat()
             val h = canvas.height.toFloat()
 
-            canvas.drawColor(Color.parseColor("#0a0a0a"))
+            val synth = pixelVariant == "synth"
 
-            val palette = PIXEL_PALETTE
+            val palette: IntArray
+            val bg: Int
+            val cols: Int
+            val rows: Int
+            val flowSpeed: Float
+            val waveSpread: Float
+            val pulseSpeed: Float
+            val baseAlpha: Float
+            val alphaRange: Float
 
-            val cols = 16
-            val rows = 28
+            if (synth) {
+                palette = derivedPixelPalette
+                bg = Color.parseColor("#000000")
+                cols = 20
+                rows = 36
+                flowSpeed = 1.15f
+                waveSpread = 0.7f
+                pulseSpeed = 1.6f
+                baseAlpha = 0.55f
+                alphaRange = 0.45f
+            } else {
+                palette = derivedPixelPalette
+                bg = Color.parseColor("#0A1622")
+                cols = 12
+                rows = 21
+                flowSpeed = 0.5f
+                waveSpread = 0.42f
+                pulseSpeed = 0.7f
+                baseAlpha = 0.5f
+                alphaRange = 0.24f
+            }
+
+            canvas.drawColor(bg)
+
             val cellW = w / cols
             val cellH = h / rows
 
-            val globalPulse = (sin(elapsed * 0.85) * 0.5 + 0.5) * 0.22f + 0.78f
+            val globalPulse = (sin(elapsed * (if (synth) 0.95f else 0.4f)) * 0.5 + 0.5f).toFloat()
 
             for (row in 0 until rows) {
                 val y = row * cellH
                 for (col in 0 until cols) {
                     val base = (col * 7 + row * 13) and 0x7FFFFFFF
-                    val f = (sin(elapsed * 1.15 + col * 0.7 + row * 0.55) * 0.5 + 0.5f).toFloat()
-                    val a = palette[base % 4]
-                    val b = palette[(base + 1) % 4]
-                    val pulse = (sin(elapsed * 1.6 + col * 0.3 + row * 0.9) * 0.5 + 0.5f).toFloat() * 0.38f + 0.42f
-                    val alpha = (pulse * globalPulse * 255).toInt().coerceIn(0, 255)
+                    val f = (sin(elapsed * flowSpeed + col * waveSpread + row * waveSpread) * 0.5 + 0.5f).toFloat()
+                    val a = palette[base % palette.size]
+                    val b = palette[(base + 1) % palette.size]
+                    val pulse = (sin(elapsed * pulseSpeed + col * 0.3 + row * 0.9) * 0.5 + 0.5f).toFloat()
+                    val alpha = ((baseAlpha + alphaRange * pulse) * (0.85f + 0.15f * globalPulse) * 255).toInt().coerceIn(0, 255)
                     val x = col * cellW
 
                     val r = (Color.red(a) + (Color.red(b) - Color.red(a)) * f).toInt()
@@ -1183,8 +1296,432 @@ class LiveWallpaperService : WallpaperService() {
             }
         }
 
+        /**
+         * Premium "Dark Elegant" flowing-gradient wallpaper. Three large soft
+         * radial-gradient orbs (charcoal / deep purple / soft lavender) drift and
+         * expand slowly over a ~14s loop on a very dark charcoal background.
+         * Only a handful of GPU-accelerated drawCircle calls per frame — no
+         * particles, no complexity — so it stays 60 FPS and battery-friendly on
+         * mid-range devices. Color blends and positions use simple linear sine
+         * motion; gradients are built once per surface size and reused.
+         */
+        private fun drawAura(canvas: Canvas, elapsed: Float) {
+            val w = canvas.width.toFloat()
+            val h = canvas.height.toFloat()
+
+            canvas.drawColor(Color.parseColor("#16161F"))
+
+            if (auraGradientRes != canvas.width || auraGradients[0] == null) {
+                // Derive aura orb tints from the chosen accent colour.
+                val hsv = FloatArray(3)
+                android.graphics.Color.colorToHSV(accentColor, hsv)
+                val lightHsv = floatArrayOf(hsv[0], maxOf(0.4f, hsv[1] * 0.8f), minOf(1f, hsv[2] * 1.3f))
+                val soft = android.graphics.Color.HSVToColor(lightHsv)
+                val deep = android.graphics.Color.HSVToColor(floatArrayOf(hsv[0], minOf(1f, hsv[1] + 0.2f), maxOf(0.08f, hsv[2] * 0.5f)))
+                auraGradients = arrayOf(
+                    android.graphics.RadialGradient(0f, 0f, 1f, intArrayOf(soft, accentColor, deep),
+                        floatArrayOf(0f, 0.55f, 1f), android.graphics.Shader.TileMode.CLAMP),
+                    android.graphics.RadialGradient(0f, 0f, 1f, intArrayOf(accentColor, deep, soft),
+                        floatArrayOf(0f, 0.5f, 1f), android.graphics.Shader.TileMode.CLAMP),
+                    android.graphics.RadialGradient(0f, 0f, 1f, intArrayOf(soft, deep, accentColor),
+                        floatArrayOf(0f, 0.6f, 1f), android.graphics.Shader.TileMode.CLAMP),
+                )
+                auraGradientRes = canvas.width
+            }
+
+            val loop = 14f
+            val t = elapsed % loop
+
+            // Three orbs drift on slow, independent sine loops.
+            val orbData = arrayOf(
+                Triple(0.28f, 0.32f, 0.0f),   // frac cx, frac cy(inv), phase
+                Triple(0.62f, 0.58f, 2.1f),
+                Triple(0.45f, 0.78f, 4.2f),
+            )
+
+            for (i in orbData.indices) {
+                val (fx, fyInv, phase) = orbData[i]
+                val cx = w * (fx + 0.12f * sin(t * 0.5 + phase).toFloat())
+                val cy = h * (fyInv - 0.10f * cos(t * 0.4 + phase * 1.3).toFloat())
+                val baseR = w * (0.34f + 0.05f * sin(t * 0.35 + phase * 2.0).toFloat())
+                val radius = baseR * (0.9f + 0.25f * sin(t * 0.6 + phase).toFloat())
+
+                val grad = auraGradients[i % auraGradients.size]
+                grad?.let { g ->
+                    auraPaint.shader = g
+                    auraPaint.alpha = 150 + (110 * (0.5f + 0.5f * sin(t * 0.5 + phase).toFloat())).toInt()
+                    // The cached gradient is unit-spaced; scale it to the orb radius
+                    // by drawing through a centred transform.
+                    canvas.save()
+                    canvas.translate(cx, cy)
+                    canvas.scale(radius, radius)
+                    canvas.drawCircle(0f, 0f, 1f, auraPaint)
+                    canvas.restore()
+                }
+            }
+        }
+
+        /**
+         * Premium "living light" aurora wallpaper — the flagship dynamic style.
+         *
+         * A deep midnight-navy canvas carrying several large, feathered colour
+         * fields (midnight navy, indigo, violet, electric purple, soft lavender,
+         * magenta) that drift, stretch, rotate and breathe on slow independent
+         * sine loops. Each field is a soft radial-gradient blob that bleeds past
+         * the screen edges and blends into its neighbours, so the composition
+         * morphs continuously with no visible beginning or end. A subtle rolling
+         * film-grain veil and gentle vignette add depth while keeping the look
+         * clean and OLED-friendly.
+         */
+        private fun drawAurora(canvas: Canvas, elapsed: Float) {
+            val w = canvas.width.toFloat()
+            val h = canvas.height.toFloat()
+
+            // Deep midnight-navy canvas.
+            canvas.drawColor(android.graphics.Color.rgb(2, 7, 20))
+
+            // Derive the accent-seeded hues (midnight navy, indigo, violet, purple,
+            // lavender, magenta) around the user's chosen accent colour.
+            val accentHsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, accentHsv)
+
+            val base = accentHsv[0]
+            val fields = arrayOf(
+                // [hueOffset, saturation, value, sizeFrac, baseXFrac, cyFrac, bleed, alpha]
+                floatArrayOf(0f, 0.62f, 0.16f, 1.35f, 0.02f, 0.06f, 0.35f, 0.95f),  // midnight navy
+                floatArrayOf(-28f, 0.62f, 0.32f, 1.15f, 0.14f, 0.12f, 0.4f, 0.55f), // indigo
+                floatArrayOf(-10f, 0.7f, 0.42f, 1.05f, 0.42f, 0.32f, 0.22f, 0.55f), // violet
+                floatArrayOf(12f, 0.75f, 0.55f, 0.95f, 0.60f, 0.50f, 0.28f, 0.5f),  // electric purple
+                floatArrayOf(30f, 0.55f, 0.78f, 0.9f, 0.72f, 0.62f, 0.18f, 0.5f),  // soft lavender
+                floatArrayOf(52f, 0.7f, 0.66f, 1.0f, 0.98f, 0.82f, 0.4f, 0.42f),  // magenta / hot pink
+            )
+
+            // Layer count-controlled blobs so the effect is rich but still cheap.
+            val layers = 3
+            val loop = 34f // very slow, seamless loop
+            val t = elapsed % loop
+
+            for (li in 0 until layers) {
+                for (field in fields) {
+                    val hueOffset = field[0]; val sat = field[1]; val value = field[2]
+                    val sizeFrac = field[3]; val cxFrac = field[4]; val cyFrac = field[5]
+                    val bleed = field[6]; val alpha = field[7]
+
+                    // Independent sinusoidal motion per layer: large forms drift,
+                    // and the hue subtly flows so colours migrate between regions.
+                    val phase = li * 1.7f + hueOffset * 0.03f
+                    val cx = w * (cxFrac + 0.10f * sin(t * 0.35f + phase).toFloat())
+                    val cy = h * (cyFrac - 0.08f * cos(t * 0.28f + phase * 1.1).toFloat())
+                    val radius = w * (sizeFrac * 0.5f) * (0.92f + 0.16f * sin(t * 0.2f + phase * 2.0).toFloat())
+
+                    // Gentle hue drift so neighbouring regions blend into each other.
+                    val hue = (base + hueOffset + 8.0f * sin(t * 0.05f + phase).toFloat() + 360.0f) % 360.0f
+                    val center = android.graphics.Color.HSVToColor(
+                        floatArrayOf(hue, sat.coerceIn(0.35f, 0.85f), value.coerceIn(0.12f, 0.9f))
+                    )
+
+                    // Feathered radial gradient: centre colour → soft edge (transparent).
+                    var colorInt = center.toInt()
+                    val cRed = (colorInt shr 16) and 0xFF
+                    val cGreen = (colorInt shr 8) and 0xFF
+                    val cBlue = colorInt and 0xFF
+                    val fade = android.graphics.Color.argb(
+                        ((alpha * 255).toInt()).coerceIn(0, 255),
+                        cRed, cGreen, cBlue
+                    )
+
+                    if (li == 0) {
+                        auroraGradient = android.graphics.RadialGradient(
+                            0f, 0f, 1f,
+                            intArrayOf(fade, center, android.graphics.Color.TRANSPARENT),
+                            floatArrayOf(0f, 0.55f, 1f),
+                            android.graphics.Shader.TileMode.CLAMP
+                        )
+                    } else {
+                        auroraGradient = android.graphics.RadialGradient(
+                            0f, 0f, 1f,
+                            intArrayOf(fade, center, android.graphics.Color.TRANSPARENT),
+                            floatArrayOf(0.1f, 0.6f, 1f),
+                            android.graphics.Shader.TileMode.CLAMP
+                        )
+                    }
+
+                    // Draw the feathered blob, allowing it to bleed far past the edges.
+                    val scale = radius * (1f + bleed)
+                    auroraPaint.shader = auroraGradient
+                    auroraPaint.alpha = ((alpha * 255) * (0.75f + 0.25f * sin(t * 0.4f + phase * 1.3f).toFloat())).toInt().coerceIn(0, 255)
+                    canvas.save()
+                    canvas.translate(cx, cy)
+                    canvas.scale(scale, scale)
+                    canvas.drawCircle(0f, 0f, 1f, auroraPaint)
+                    canvas.restore()
+                }
+            }
+
+            // Soft vignette to deepen the corners and keep the composition centred.
+            vignetteGradient = android.graphics.RadialGradient(
+                w / 2f, h / 2f, h * 0.9f,
+                intArrayOf(android.graphics.Color.TRANSPARENT, android.graphics.Color.argb(120, 0, 2, 12)),
+                floatArrayOf(0.55f, 1f),
+                android.graphics.Shader.TileMode.CLAMP
+            )
+            vignettePaint.shader = vignetteGradient
+            canvas.drawRect(0f, 0f, w, h, vignettePaint)
+
+            // Subtle rolling film grain for texture (fast, non-allocating-ish via paint).
+            val currentGrain = grainBitmap
+            if (currentGrain == null || currentGrain.width != canvas.width) {
+                buildGrain(canvas.width, canvas.height)
+            }
+            grainBitmap?.let { gb ->
+                grainPaint.alpha = 26 + (6 * sin(elapsed * 0.7).toInt())
+                canvas.drawBitmap(gb, 0f, 0f, grainPaint)
+            }
+        }
+
+        private fun buildGrain(width: Int, height: Int) {
+            if (width <= 0 || height <= 0) return
+            val smallW = (width / 4).coerceAtLeast(1)
+            val smallH = (height / 4).coerceAtLeast(1)
+            val bmp = android.graphics.Bitmap.createBitmap(smallW, smallH, android.graphics.Bitmap.Config.ARGB_8888)
+            val pixels = IntArray(smallW * smallH)
+            val rnd = java.util.Random(1337)
+            for (i in pixels.indices) {
+                val v = (rnd.nextInt(40) - 20 + 128).coerceIn(0, 255)
+                pixels[i] = android.graphics.Color.argb(255, v, v, v)
+            }
+            bmp.setPixels(pixels, 0, smallW, 0, 0, smallW, smallH)
+            grainBitmap = bmp
+            grainPaint.isFilterBitmap = true
+        }
+
+        private fun drawMembrane(canvas: Canvas, elapsed: Float) {
+            val w = canvas.width.toFloat()
+            val h = canvas.height.toFloat()
+
+            // Deep midnight-navy void (spacious upper/right negative space),
+            // just above pure black so the OLED panel can rest true blacks.
+            canvas.drawColor(Color.rgb(2, 6, 16))
+
+            val accentHsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, accentHsv)
+            val baseHue = accentHsv[0]
+
+            // One seamless, ultra-slow loop. Every term is a submultiple so the
+            // whole composition returns to its start with no visible jump.
+            val loop = 44f
+            val t = elapsed % loop
+            val p = (2f * Math.PI * (t / loop)).toFloat()
+
+            // Rebuild the cached palette + unit gradients only when the accent hue
+            // changes (user picks a new accent colour), not every frame.
+            if (mbCacheHue != baseHue) mbBuildCache(baseHue)
+
+            // A small helper: slow sum-of-sines drift (phase-shifted, integer
+            // harmonics) so gestures never speed up and the loop stays seamless.
+            // Pure Float (no Double boxing) to keep the render loop cheap.
+            fun drift(a: Float, b: Float, c: Float): Float {
+                val A = a; val B = b; val C = c; val P = p
+                return 0.5f * kotlin.math.sin(A * P + B) +
+                    0.3f * kotlin.math.sin(2.0f * A * P + C + 1.7f) +
+                    0.2f * kotlin.math.sin(3.0f * A * P + B * 1.3f)
+            }
+
+            // Reposition a cached unit radial gradient to (cx, cy, radius) using
+            // the shared matrix — no per-frame shader or array allocation.
+            fun place(paint: Paint, shader: android.graphics.RadialGradient?, cx: Float, cy: Float, radius: Float) {
+                mbMatrix.setTranslate(cx, cy)
+                mbMatrix.preScale(radius, radius)
+                shader?.setLocalMatrix(mbMatrix)
+                paint.shader = shader
+            }
+
+            // ---- 1. The luminous pink/lavender surface, lower-left ----
+            // Enormous radius so the bright pale core is pushed toward the bottom
+            // edge and the feather bleeds up into the middle and left — reading as
+            // one huge curved organic surface, not a centred orb.
+            val pA = drift(0.55f, 0.0f, 0.4f)
+            val pinkCx = w * (0.30f + 0.04f * pA)
+            val pinkCy = h * (0.78f + 0.05f * drift(0.5f, 2.1f, 1.2f))
+            val pinkR = h * (0.95f + 0.08f * drift(0.33f, 1.0f, 0.2f))
+            place(membranePaint, mbPink, pinkCx, pinkCy, pinkR)
+            membranePaint.alpha = 255
+            canvas.drawRect(0f, 0f, w, h, membranePaint)
+
+            // ---- 2. The deep crimson / wine surface, lower-right ----
+            // Darker and atmospheric, merging into the pink region above the sweep.
+            val pB = drift(0.48f, 3.0f, 1.9f)
+            val wineCx = w * (0.86f + 0.05f * pB)
+            val wineCy = h * (0.85f + 0.04f * drift(0.42f, 4.4f, 0.9f))
+            val wineR = h * (1.0f + 0.06f * drift(0.28f, 2.2f, 3.1f))
+            place(membranePaint, mbWine, wineCx, wineCy, wineR)
+            membranePaint.alpha = 235
+            canvas.drawRect(0f, 0f, w, h, membranePaint)
+
+            // ---- 3. The deep-navy/indigo upper region ----
+            // A cool, very dark mass in the upper-left keeps the empty navy top
+            // from feeling flat while leaving the upper-right truly sparse.
+            val indigoCx = w * (0.18f + 0.05f * drift(0.5f, 5.0f, 0.6f))
+            val indigoCy = h * (0.16f + 0.05f * drift(0.44f, 1.4f, 2.6f))
+            val indigoR = h * (0.55f + 0.10f * drift(0.38f, 3.6f, 1.5f))
+            place(membranePaint, mbIndigo, indigoCx, indigoCy, indigoR)
+            membranePaint.alpha = 170
+            canvas.drawRect(0f, 0f, w, h, membranePaint)
+
+            // ---- 4. One huge flowing curved boundary ----
+            // A single organic curve sweeping from upper-middle down to the lower
+            // third, feathered on both sides. It carves out the negative space and
+            // gives the surfaces their 2.5D depth without any hard edge.
+            val sweepX = w * (0.62f + 0.05f * drift(0.5f, 0.8f, 2.2f))
+            val amp = h * (0.14f + 0.05f * drift(0.4f, 5.5f, 0.3f))
+            val peakY = h * (0.30f + 0.06f * drift(0.3f, 2.6f, 4.1f))
+            membranePath.reset()
+            membranePath.moveTo(-w, h)
+            membranePath.cubicTo(
+                w * 0.10f, h * (0.96f + 0.04f * drift(0.35f, 6.0f, 0.5f)),  // control 1
+                w * 0.34f, h * 0.86f - amp,                                        // control 2
+                sweepX, peakY                                                       // end (upper, on the dark side)
+            )
+            membranePath.cubicTo(
+                sweepX + amp, peakY - h * 0.12f,
+                w * 1.05f, h * 0.10f,
+                w * 1.2f, -h * 0.2f
+            )
+            membranePath.lineTo(w * 1.2f, h)
+            membranePath.close()
+
+            place(membranePaint, mbBoundary, sweepX - w * 0.18f, peakY + amp, h * 0.9f)
+            membranePaint.alpha = 120
+            canvas.drawPath(membranePath, membranePaint)
+
+            // ---- 5. "Moving supernova" core + radiating rays ----
+            // A bright, breathing energy heart with a soft expanding glow, then
+            // a set of luminous rays that stream outward from it — the active,
+            // supernova-like motion layer on top of the calm colour surfaces.
+            val coreX = w * (0.32f + 0.05f * drift(0.5f, 4.0f, 1.1f))
+            val coreY = h * (0.72f + 0.05f * drift(0.44f, 6.2f, 2.4f))
+
+            // Core brightness and size breathe on a slow, audible "heartbeat".
+            val beat = 0.5f + 0.5f * sin(elapsed * 0.9f).toFloat() // 0..1
+            val coreR = w * (0.085f + 0.030f * beat)
+
+            // Soft outer glow that swells around the core.
+            place(corePaint, mbCoreGlow, coreX, coreY, coreR * 3.4f)
+            corePaint.alpha = (110 + 90 * beat).toInt().coerceIn(0, 255)
+            canvas.drawCircle(coreX, coreY, coreR * 3.4f, corePaint)
+
+            // Bright inner heart.
+            corePaint.shader = null
+            corePaint.color = mbWhiteHot
+            corePaint.alpha = (170 + 70 * beat).toInt().coerceIn(0, 255)
+            canvas.drawCircle(coreX, coreY, coreR, corePaint)
+
+            // Radiating rays: each one sways, rotates and pulses independently so
+            // the whole field streams outward like supernova filaments.
+            val rayCount = 12
+            repeat(rayCount) { i ->
+                val base = (i.toFloat() / rayCount) * 2f * Math.PI.toFloat()
+                val rot = base + 0.7f * sin(elapsed * 0.22f + i * 1.7f).toFloat()
+                val sway = 0.6f * sin(elapsed * 0.31f + i * 2.3f).toFloat()
+                val lenBreath = 0.5f + 0.5f * sin(elapsed * 0.40f + i * 1.1f).toFloat()
+                val length = w * (0.45f + 0.95f * lenBreath)
+                val startX = coreX + cos(rot) * coreR
+                val startY = coreY + sin(rot) * coreR
+                val endX = coreX + cos(rot + sway * 0.2f) * length
+                val endY = coreY + sin(rot + sway * 0.2f) * length
+                // A control point off the chord curving each ray into a filament.
+                val mx = (startX + endX) / 2f + cos(sway) * (endY - startY) * 0.22f
+                val my = (startY + endY) / 2f - sin(sway) * (endX - startX) * 0.22f
+
+                rayPath.reset()
+                rayPath.moveTo(startX, startY)
+                rayPath.quadTo(mx, my, endX, endY)
+
+                // Soft luminous halo around the ray.
+                rayPaint.shader = null
+                rayPaint.color = mbRayHalo
+                rayPaint.strokeWidth = w * (0.014f + 0.010f * beat)
+                rayPaint.alpha = (26 + 30 * lenBreath).toInt().coerceIn(0, 90)
+                canvas.drawPath(rayPath, rayPaint)
+
+                // Bright inner filament.
+                rayPaint.color = mbRayInner
+                rayPaint.strokeWidth = w * (0.0035f + 0.0025f * beat)
+                rayPaint.alpha = (120 + 110 * beat).toInt().coerceIn(0, 235)
+                canvas.drawPath(rayPath, rayPaint)
+            }
+
+            // ---- Soft vignette to dim the corners and centre the glow ----
+            place(vignettePaint, mbVignette, w / 2f, h * 0.45f, h * 0.95f)
+            canvas.drawRect(0f, 0f, w, h, vignettePaint)
+        }
+
+        private fun mbHsv(baseHue: Float, hueOffset: Float, sat: Float, value: Float): Int =
+            android.graphics.Color.HSVToColor(
+                floatArrayOf(((baseHue + hueOffset) % 360f + 360f) % 360f, sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f))
+            )
+
+        // Build the membrane palette + unit radial gradients once per accent hue.
+        // The gradients are anchored at the origin with unit radius and moved each
+        // frame via mbMatrix, so this runs only on accent changes — never per frame.
+        private fun mbBuildCache(baseHue: Float) {
+            mbWhiteHot = mbHsv(baseHue, -2f, 0.16f, 1.0f)
+            mbPaleHot = mbHsv(baseHue, -8f, 0.45f, 0.95f)
+            mbHotViolet = mbHsv(baseHue, -22f, 0.6f, 0.7f)
+            mbRayInner = mbHsv(baseHue, -10f, 0.5f, 0.96f)
+            mbRayHalo = mbHsv(baseHue, -20f, 0.55f, 0.78f)
+
+            fun unit(colors: IntArray, positions: FloatArray) =
+                android.graphics.RadialGradient(0f, 0f, 1f, colors, positions, android.graphics.Shader.TileMode.CLAMP)
+
+            mbPink = unit(
+                intArrayOf(
+                    mbHsv(baseHue, -6f, 0.32f, 0.97f),
+                    mbHsv(baseHue, -18f, 0.5f, 0.85f),
+                    mbHsv(baseHue, -30f, 0.62f, 0.62f),
+                    mbHsv(baseHue, -40f, 0.66f, 0.42f),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.28f, 0.55f, 0.78f, 1f)
+            )
+            mbWine = unit(
+                intArrayOf(
+                    mbHsv(baseHue, 8f, 0.7f, 0.55f),
+                    mbHsv(baseHue, 10f, 0.78f, 0.38f),
+                    mbHsv(baseHue, 16f, 0.8f, 0.22f),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.32f, 0.62f, 1f)
+            )
+            mbIndigo = unit(
+                intArrayOf(
+                    mbHsv(baseHue, -52f, 0.55f, 0.16f),
+                    mbHsv(baseHue, -34f, 0.55f, 0.30f),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.45f, 1f)
+            )
+            mbBoundary = unit(
+                intArrayOf(
+                    mbHsv(baseHue, -14f, 0.42f, 0.66f),
+                    mbHsv(baseHue, -34f, 0.6f, 0.4f),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.5f, 1f)
+            )
+            mbCoreGlow = unit(
+                intArrayOf(mbWhiteHot, mbPaleHot, mbHotViolet, android.graphics.Color.TRANSPARENT),
+                floatArrayOf(0f, 0.30f, 0.62f, 1f)
+            )
+            mbVignette = unit(
+                intArrayOf(android.graphics.Color.TRANSPARENT, android.graphics.Color.argb(150, 0, 3, 14)),
+                floatArrayOf(0.5f, 1f)
+            )
+            mbCacheHue = baseHue
+        }
+
         private fun drawFrame(canvas: Canvas, animSeconds: Float) {
-            val elapsed = if (wallpaperKind == "battery" || wallpaperKind == "pixel")
+            val elapsed = if (wallpaperKind == "battery" || wallpaperKind == "membrane")
                 animSeconds else (System.currentTimeMillis() - startedAt) / 1000f
             val bgColor = Color.parseColor("#020817")
             canvas.drawColor(bgColor)
@@ -1198,8 +1735,8 @@ class LiveWallpaperService : WallpaperService() {
                 return
             }
 
-            if (wallpaperKind == "pixel") {
-                drawPixelArt(canvas, elapsed)
+            if (wallpaperKind == "membrane") {
+                drawMembrane(canvas, elapsed)
                 return
             }
 
@@ -1276,16 +1813,36 @@ class LiveWallpaperService : WallpaperService() {
             val accentStr = preferences.getString("W_ACCENT", "#7C3AED") ?: "#7C3AED"
             accentColor = try { Color.parseColor(accentStr) } catch (_: Exception) { Color.parseColor("#7C3AED") }
 
+            // Derive pixel variant from accent brightness instead of exact colour match.
+            val hsv = FloatArray(3)
+            Color.colorToHSV(accentColor, hsv)
+            pixelVariant = when {
+                hsv[1] < 0.35f && hsv[2] > 0.8f -> "calm"
+                hsv[2] < 0.35f -> "aura"
+                else -> "synth"
+            }
+
+            // Build a 3-colour palette from the accent: accent itself, a hue-shifted
+            // complement, and a dark/shadow tone — replacing the old hardcoded arrays.
+            val compHsv = floatArrayOf((hsv[0] + 150) % 360, maxOf(0.55f, hsv[1]), minOf(1f, hsv[2] + 0.1f))
+            val darkHsv = floatArrayOf((hsv[0] + 30) % 360, maxOf(0.4f, hsv[1]), maxOf(0.15f, hsv[2] * 0.35f))
+            derivedPixelPalette = intArrayOf(
+                accentColor,
+                Color.HSVToColor(compHsv),
+                Color.HSVToColor(darkHsv),
+            )
+
+            // Secondary colour for doodle orbit: accent hue opposite on the wheel.
+            hsv[0] = (hsv[0] + 180) % 360
+            secondaryColor = Color.HSVToColor(hsv)
+
+            auraGradientRes = 0 // force aura gradients to rebuild for a new surface size
+
             Log.i(TAG, "LOAD CONFIG (${if (usePreview) "preview" else "committed"}): kind=$wallpaperKind, path=$configuredVideoUriString, rotation=$videoRotationDegrees")
             if (configuredVideoUriString.startsWith("file://")) {
                 val configuredFile = File(Uri.parse(configuredVideoUriString).path ?: "")
                 Log.i(TAG, "Configured file: path=${configuredFile.absolutePath} exists=${configuredFile.exists()} bytes=${configuredFile.length()} readable=${configuredFile.canRead()}")
             }
-
-            val hsv = FloatArray(3)
-            Color.colorToHSV(accentColor, hsv)
-            hsv[0] = (hsv[0] + 180) % 360
-            secondaryColor = Color.HSVToColor(hsv)
         }
 
         /** Registers the battery broadcast receiver once for the fluid wallpaper. */
@@ -1430,13 +1987,5 @@ class LiveWallpaperService : WallpaperService() {
 
     companion object {
         private const val TAG = "LiveWallpaperService"
-
-        // Brand palette for the pixel-art wallpaper.
-        private val PIXEL_PALETTE = intArrayOf(
-            android.graphics.Color.parseColor("#FF006E"),
-            android.graphics.Color.parseColor("#00D9FF"),
-            android.graphics.Color.parseColor("#8338EC"),
-            android.graphics.Color.parseColor("#FFBE0B"),
-        )
     }
 }

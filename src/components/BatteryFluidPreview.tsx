@@ -5,15 +5,43 @@ type Props = {
   level?: number;
   charging?: boolean;
   compact?: boolean;
+  accent?: string;
 };
 
+/* ── colour helpers ────────────────────────────────────────────────────── */
+
+function hexToRgb(hex: string): [number, number, number] {
+  const clean = hex.replace('#', '');
+  const full = clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean;
+  return [
+    parseInt(full.slice(0, 2), 16),
+    parseInt(full.slice(2, 4), 16),
+    parseInt(full.slice(4, 6), 16),
+  ];
+}
+
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255, gn = g / 255, bn = b / 255;
+  const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+  if (d !== 0) {
+    if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) * 60;
+    else if (max === gn) h = ((bn - rn) / d + 2) * 60;
+    else h = ((rn - gn) / d + 4) * 60;
+  }
+  return [h, s, v];
+}
+
 /**
- * JS approximation of the native battery-fluid wallpaper. This is not the real
- * accelerometer/gyro feed (that only runs inside the wallpaper service), but it
- * previews the animated liquid, the color-by-level behaviour and the charging
- * state so the user knows what they will get before applying.
+ * JS approximation of the native battery-fluid wallpaper.  The fluid colour
+ * shifts through a full health spectrum driven by battery level: red/orange at
+ * low, green/cyan in the healthy mid-range, and fresh blue at full.  The
+ * accent seeds the hue family so the custom colour picker still matters.
  */
-export function BatteryFluidPreview({ level = 50, charging = false, compact = false }: Props) {
+export const BatteryFluidPreview = React.memo(function ({ level = 50, charging = false, compact = false, accent }: Props) {
   const stageHeight = compact ? 150 : 420;
   const stageWidth = compact ? 92 : 250;
   const baseRadius = compact ? 18 : 28;
@@ -74,11 +102,23 @@ export function BatteryFluidPreview({ level = 50, charging = false, compact = fa
     return () => loop.stop();
   }, [drift]);
 
+  /* ── Health-spectrum colour driven by battery level ────────────────────────
+   * Shifts through a full hue range so the level is readable at a glance:
+   *   level 0   → hue −110° (red/orange, urgent)
+   *   level 50% → hue ±0°   (accent / healthy mid)
+   *   level 100%→ hue +130° (fresh cyan-blue, full)
+   * The accent seeds the hue family so the custom colour picker still matters.
+   */
+  const [r, g, b] = hexToRgb(accent || '#22C55E');
+  const [accentHue, satRaw] = rgbToHsv(r, g, b);
+  const sat = Math.max(0.65, satRaw);
   const fillRatio = Math.max(0.04, Math.min(1, level / 100));
-  const hue = fillRatio * 120;
-  const bodyColor = `hsl(${hue}, 75%, ${charging ? 60 : 52}%)`;
-  const deepColor = `hsl(${hue}, 82%, 32%)`;
-  const topBand = `hsla(${hue}, 90%, 82%, 0.55)`;
+  // +240° sweep from −110° to +130° around the accent hue, matching the native ramp.
+  const hue = (((accentHue - 110 + 240 * fillRatio) % 360) + 360) % 360;
+  const light = charging ? 60 : 52;
+  const bodyColor = `hsl(${hue}, ${Math.round(sat * 100)}%, ${light}%)`;
+  const deepColor = `hsl(${hue}, ${Math.round(Math.max(50, sat * 110))}%, 32%)`;
+  const topBand = `hsla(${hue}, ${Math.round(Math.min(100, sat * 120))}%, 82%, 0.55)`;
 
   const opac = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.9, charging ? 1 : 0.8] });
   const sway = drift.interpolate({ inputRange: [0, 0.5, 1], outputRange: [-10, 8, -10] });
@@ -120,13 +160,13 @@ export function BatteryFluidPreview({ level = 50, charging = false, compact = fa
           pointerEvents="none"
           style={[
             styles.chargingGlow,
-            { borderColor: `hsl(${hue}, 90%, 75%)`, opacity: glow },
+            { borderColor: `hsl(${hue}, ${Math.round(Math.min(100, sat * 120))}%, 75%)`, opacity: glow },
           ]}
         />
       )}
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   stage: {

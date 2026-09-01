@@ -120,13 +120,14 @@ export const wallpaperBridge = {
 
   async applyWallpaper(
     id: string,
-    kind: 'doodle' | 'video' | 'static' | 'battery' | 'pixel',
+    kind: 'doodle' | 'video' | 'static' | 'battery' | 'membrane',
     destination: 'HOME' | 'LOCK' | 'BOTH',
     videoUri?: string,
     loop = true,
     playbackDuration = 30,
     audio = false,
     rotation = 0,
+    accent = '#7C3AED',
   ): Promise<WallpaperApplyResult> {
     try {
       console.log('[WallpaperBridge] applyWallpaper request', {
@@ -138,11 +139,12 @@ export const wallpaperBridge = {
         playbackDuration,
         audio,
         rotation,
+        accent,
       });
       const nativeModule = getNativeModule();
       if (nativeModule && typeof nativeModule.applyWallpaper === 'function') {
         const result = await withTimeout(
-          nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio, rotation),
+          nativeModule.applyWallpaper(id, kind, destination, videoUri ?? '', loop, playbackDuration, audio, rotation, accent),
           NATIVE_CALL_TIMEOUT_MS,
           'applyWallpaper',
         );

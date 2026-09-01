@@ -11,6 +11,7 @@ The React Native layer is the editor and library UI. The Android layer owns the 
 - React Native app builds from the `wall_e` directory.
 - Android is the supported runtime. iOS files exist because the project was scaffolded, but the wallpaper implementation is Android-only.
 - Doodle rendering is implemented in both the React preview and native wallpaper service.
+- Animated pixel-art wallpapers are implemented natively and in the app: `Pixel Calm` (minimalist teal/ocean, meditative), `Pixel Synthwave` (neon pink/cyan/purple on black, retro-futuristic), and `Aura` (premium flowing deep-purple/lavender gradient on charcoal). All are `pixel`-kind dynamic wallpapers rendered by `WallpaperService.drawPixelArt()` (with `drawAura()` for the gradient variant).
 - Video picking uses Android `ACTION_OPEN_DOCUMENT` with `video/*`.
 - First app launch requests media access:
   - Android 13/API 33+: `READ_MEDIA_VIDEO`
@@ -69,7 +70,7 @@ The wallpaper service receives an app-owned file that remains readable after the
   - Uses an animated accent indicator.
 
 - `src/types.ts`
-  - `WallpaperKind`: `doodle | video | static`.
+  - `WallpaperKind`: `doodle | video | static | battery | pixel`.
   - `Wallpaper`: UI/library model; optional video URI, loop, audio, and playback duration fields.
   - `PickedVideo`: `{ uri, durationSeconds }`.
   - `WallpaperCapabilities`, `WallpaperApplyResult`, and `WallpaperError` contracts.
@@ -137,12 +138,12 @@ The wallpaper service receives an app-owned file that remains readable after the
 `WallpaperModule.saveWallpaperConfig()` writes these keys to `SharedPreferences("wallpaper_pref", 0)`:
 
 - `W_ID`: wallpaper ID
-- `W_KIND`: `doodle`, `video`, or `static` (static is used by both image-picked and AI-generated wallpapers)
+- `W_KIND`: `doodle`, `video`, `static`, `battery`, or `pixel` (static is used by both image-picked and AI-generated wallpapers)
 - `W_PATH`: video URI; currently an app-private `file://` URI for selected videos
 - `W_LOOP`: boolean loop setting
 - `W_DURATION`: playback duration clamped from 1 to 30 seconds
 - `W_AUDIO`: boolean audio setting
-- `W_ACCENT`: accent color, with a native fallback if empty
+- `W_ACCENT`: accent color, with a native fallback if empty. For `pixel`-kind wallpapers the accent selects the variant: teal `#06FFA5` => calm, otherwise synthwave.
 - `W_ROTATION`: rotation in degrees `0/90/180/270` (added with the video rotation feature)
 
 `WallpaperService.loadConfiguration()` reads the same keys. Keep these names and value types synchronized if the native contract changes.
@@ -294,3 +295,37 @@ Targeted fixes for wallpaper-engine lifecycle bugs surfaced from on-device testi
 6. **Doodle entries removed** (`src/data/mockWallpapers.ts`): removed the `doodle-aurora`/`doodle-spark` entries and all four predefined doodles (now an empty array). The runtime catalog `bundledWallpapers.ts` never contained doodles (all `live-*`/`static-*`), and `mockWallpapers.ts` is unused by app code. Only the doodle *entries* were removed; the doodle *capability* (kind, editor option, native renderer, styles) was intentionally kept per user scope choice.
 
 Verification: `tsc --noEmit` clean; Jest passes; no native rebuild/install performed this round (user builds/tests on-device themselves).
+
+## Recent Changes — Pixel Art Wallpapers & Bridge Accent (this round)
+
+Added two animated pixel-art dynamic wallpapers (a new `pixel` kind) plus the plumbing needed to carry each wallpaper's accent to the native service. Built after the battery-fluid work; the release APK was rebuilt and verified (`assets/index.android.bundle` present, TS/Kotlin/jest all green).
+
+### New `pixel` wallpaper kind
+- `WallpaperKind` (`src/types.ts`): now `'doodle' | 'video' | 'static' | 'battery' | 'pixel'`.
+- `WallpaperService.kt`: added a procedural pixel renderer.
+  - `drawPixelArt(canvas, elapsed)` renders a grid of sharp (no-anti-aliasing) pixel blocks. Pure `drawRect` fills only — no shaders, per-frame allocations, or antialiasing, so it stays smooth on low-end GPUs.
+  - Two variants selected by the configured accent (`isSynthwavePixel` field, set in `loadConfiguration()` when the accent is not teal):
+    - **Calm** (`PIXEL_CALM_PALETTE`, teal `#06FFA5` / ocean `#118AB2` / deep navy `#073B4C` on `#0A1622`): sparse 12x21 grid, slow flow (`flowSpeed 0.5`), gentle pulse — meditative.
+    - **Synthwave** (`PIXEL_SYNTH_PALETTE`, pink `#FF006E` / cyan `#00D9FF` / purple `#8338EC` on `#000000`): denser 20x36 grid, faster flow + opacity pulse — retro-futuristic.
+  - Routed through the same display-driven canvas path and the vsync `frameTimeNanos` clock as the battery fluid (`wallpaperKind == "pixel"` added to `drawWithCanvas`, the anim-clock branch, and `drawFrame`), so it stays frame-locked and jitter-free.
+- `WallpaperModule.kt`: `kind == "pixel"` flows through the same self-contained live-apply confirmation path as `battery` (no media URI/rotation/loop). Added "Animated pixel art wallpaper" to the capabilities feature list.
+
+### Accent passthrough (selects the pixel variant natively)
+- `WallpaperModule.applyWallpaper(...)` gained a final `accent: String` argument, threaded through `finishLiveApply(...)` and `savePreviewConfig(...)` so `W_ACCENT` (previously always saved as `""`) now stores the wallpaper's real accent. This survives the preview→committed copy in `resolvePendingApply` (which already copies `W_ACCENT`).
+- `wallpaperBridge.applyWallpaper(...)` accepts an `accent = '#7C3AED'` parameter and forwards it; `App.tsx` passes `wallpaper.accent`.
+- Native selects the pixel variant from `W_ACCENT` in `loadConfiguration()`.
+
+### App UI
+- Two bundled dynamic entries in `src/data/bundledWallpapers.ts`: `dynamic-pixel-calm` ("Pixel Calm") and `dynamic-pixel-synthwave` ("Pixel Synthwave"), replacing the earlier single `dynamic-pixel-art` ("Pixel Wave").
+- `src/components/PixelArtPreview.tsx`: JS approximation of the native renderer (two variants chosen by `accent` prop); all animation uses `useNativeDriver: false`.
+- `App.tsx`: wired the `pixel` kind into the LIVE PREVIEW badge, the detail-modal preview + hint (variant-aware text), `WallpaperMedia`, and `WallpaperCard` (grid), and included `pixel` in the `dynamicItems` filter.
+
+### Aura — premium flowing-gradient wallpaper (same round)
+- Added a third `pixel` variant, **Aura** ("Dark Elegant" palette from the user's options: dark charcoal `#16161F`, deep purple `#4A148C`, soft lavender `#CE93D8`), accent `#4A148C`, entry `dynamic-pixel-aura` ("Aura").
+- `WallpaperService.kt`: pixel variant selection refactored from a boolean (`isSynthwavePixel`) to a `pixelVariant` string, set in `loadConfiguration()` from `W_ACCENT` — `"calm"` (teal), `"aura"` (deep purple), else `"synth"`. Added `drawAura()`:
+  - Three large soft radial-gradient orbs (deep purple / lavender / charcoal unit-space `RadialGradient`s, built once per surface width and reused) that drift, expand, and alpha-fade over a ~14 s sine loop.
+  - Rendered via `canvas.save → translate → scale(radius) → drawCircle(unit)` so each frame is just 3 GPU-accelerated circle fills — no particles, no per-frame allocations — 60 FPS / battery-friendly on mid-range devices.
+  - `drawPixelArt()` dispatches to `drawAura()` when `pixelVariant == "aura"`.
+- `src/components/AuraFlowPreview.tsx`: JS approximation (dark canvas + 3 drifting translucent orbs, all `useNativeDriver: false`); `App.tsx` routes the accent `#4A148C` pixel wallpapers to it in the detail preview, `WallpaperMedia`, and `WallpaperCard`, with a matching hint text.
+
+Verification: `tsc --noEmit` clean; `:app:compileDebugKotlin` clean; Jest `PASS (1) FAIL (0)`; release APK rebuilt at `android/app/build/outputs/apk/release/app-release.apk` (~316.9 MB) with the JS bundle inside.

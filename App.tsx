@@ -13,6 +13,7 @@ import {
   Image,
   Modal,
   Pressable,
+  ScrollView,
   StatusBar,
   Text,
   TextInput,
@@ -26,7 +27,8 @@ import type { ReactVideoSource, VideoRef } from 'react-native-video';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { ActionButton } from './src/components/ActionButton';
 import { BatteryFluidPreview } from './src/components/BatteryFluidPreview';
-import { PixelArtPreview } from './src/components/PixelArtPreview';
+import { ColorPicker } from './src/components/ColorPicker';
+import { MembraneFlowPreview } from './src/components/MembraneFlowPreview';
 import { GeometricArt } from './src/components/GeometricArt';
 import { bundledWallpapers } from './src/data/bundledWallpapers';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
@@ -381,7 +383,7 @@ type DetailModalProps = {
   livePickerAvailable?: boolean;
 };
 
-function WallpaperDetailModal({
+const WallpaperDetailModal = React.memo(function ({
   wallpaper,
   onClose,
   onApplied,
@@ -397,6 +399,7 @@ function WallpaperDetailModal({
   const [rotation, setRotation] = React.useState(0);
   const [preparedUri, setPreparedUri] = React.useState<string | null>(null);
   const [batteryInfo, setBatteryInfo] = React.useState<{ level: number; charging: boolean } | null>(null);
+  const [showColorPicker, setShowColorPicker] = React.useState(true);
 
   const isBundledVideo = wallpaper?.kind === 'video' && wallpaper?.source != null;
   const videoUri = wallpaper?.videoUri ?? '';
@@ -506,6 +509,7 @@ function WallpaperDetailModal({
           wallpaper.playbackDuration ?? 30,
           wallpaper.audio ?? false,
           rotation,
+          wallpaper.accent,
         );
         if (result.ok) {
           const directSet =
@@ -634,6 +638,11 @@ function WallpaperDetailModal({
     <Modal visible={wallpaper !== null} animationType="slide" transparent onRequestClose={onClose}>
       <View style={styles.modalBackdrop}>
         <View style={styles.modalPanel}>
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            style={styles.modalScroll}
+            contentContainerStyle={styles.modalScrollContent}>
           {/* Loading overlay */}
           {isApplying && (
             <View style={styles.loadingOverlay}>
@@ -648,7 +657,7 @@ function WallpaperDetailModal({
               <Text style={styles.previewBadgeText}>
                 {wallpaper.kind === 'video' ||
                 wallpaper.kind === 'battery' ||
-                wallpaper.kind === 'pixel'
+                wallpaper.kind === 'membrane'
                   ? 'LIVE PREVIEW'
                   : 'PREVIEW'}
               </Text>
@@ -729,11 +738,12 @@ function WallpaperDetailModal({
               <BatteryFluidPreview
                 level={batteryInfo?.level ?? 50}
                 charging={batteryInfo?.charging ?? false}
+                accent={wallpaper.accent}
               />
             </View>
-          ) : wallpaper.kind === 'pixel' ? (
+          ) : wallpaper.kind === 'membrane' ? (
             <View style={styles.preview}>
-              <PixelArtPreview />
+              <MembraneFlowPreview accent={wallpaper.accent} />
             </View>
           ) : (
             <AnimatedPreview accent={wallpaper.accent} />
@@ -814,21 +824,42 @@ function WallpaperDetailModal({
 
           {wallpaper.kind === 'battery' && (
             <Text style={styles.staticHint}>
-              Animated green fluid fills to your real battery level, changes color as it drains,
-              surges to full while charging, and sways as you tilt your phone.
+              Animated fluid that fills to your real battery level and shifts through a
+              full health spectrum — red/orange at low, green at mid, and blue at full —
+              surges while charging, and sways as you tilt your phone.
             </Text>
           )}
 
-          {wallpaper.kind === 'pixel' && (
+          {wallpaper.kind === 'membrane' && (
             <Text style={styles.staticHint}>
-              Animated 8-bit pixel art. Neon blocks flow through electric pink, cyan and violet as
-              color waves sweep the screen.
+              Premium minimalist light. Enormous translucent surfaces of soft pink-lavender
+              and deep crimson flow slowly over a spacious midnight-navy void, separated by
+              one giant organic curve. Calm, cinematic and OLED-friendly.
             </Text>
+          )}
+
+          {(wallpaper.kind === 'battery' || wallpaper.kind === 'membrane') && (
+            <>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setShowColorPicker(prev => !prev)}
+                style={[styles.kindButton, showColorPicker && styles.kindButtonSelected]}>
+                <Text style={styles.kindButtonText}>
+                  {showColorPicker ? 'Hide Color Picker' : 'Customize Color'}
+                </Text>
+              </Pressable>
+              {showColorPicker && (
+                <ColorPicker
+                  color={wallpaper.accent}
+                  onChange={(hex) => onWallpaperUpdated({ ...wallpaper, accent: hex })}
+                />
+              )}
+            </>
           )}
 
           {(wallpaper.kind === 'video' ||
             wallpaper.kind === 'battery' ||
-            wallpaper.kind === 'pixel') &&
+            wallpaper.kind === 'membrane') &&
             !livePickerAvailable && (
               <Text style={styles.unsupportedHint}>
                 This device has no live wallpaper picker, so live wallpapers cannot be applied.
@@ -871,11 +902,12 @@ function WallpaperDetailModal({
               />
             </View>
           )}
+          </ScrollView>
         </View>
       </View>
     </Modal>
   );
-}
+});
 
 // ─── Animated Preview (doodle) ───────────────────────────────────────────
 
@@ -982,7 +1014,7 @@ function LiveThumb({
  * Renders the actual media for a wallpaper — image, video, or a fallback
  * doodle accent for placeholders.
  */
-function WallpaperMedia({
+const WallpaperMedia = React.memo(function ({
   wallpaper,
   style,
   autoPlay = false,
@@ -1020,7 +1052,7 @@ function WallpaperMedia({
       </View>
     );
   }
-  if (wallpaper.kind === 'pixel') {
+  if (wallpaper.kind === 'membrane') {
     return (
       <View
         style={[
@@ -1028,12 +1060,12 @@ function WallpaperMedia({
           styles.doodleFallback,
           { alignItems: 'center', justifyContent: 'center' },
         ]}>
-        <PixelArtPreview compact />
+        <MembraneFlowPreview compact accent={wallpaper.accent} />
       </View>
     );
   }
   return <LiveThumb key={wallpaper.id} wallpaper={wallpaper} style={style} autoPlay={autoPlay} />;
-}
+});
 
 // ─── Featured Billboard (auto-rotates every 5 seconds) ───────────────────
 
@@ -1050,7 +1082,7 @@ type BillboardProps = {
   active?: boolean;
 };
 
-function Billboard({ wallpapers, onSelect, scrollY, viewportHeight, active = true }: BillboardProps) {
+const Billboard = React.memo(function ({ wallpapers, onSelect, scrollY, viewportHeight, active = true }: BillboardProps) {
   const [index, setIndex] = React.useState(0);
   const fade = React.useRef(new Animated.Value(1)).current;
   const sectionTop = React.useRef(0);
@@ -1124,7 +1156,7 @@ function Billboard({ wallpapers, onSelect, scrollY, viewportHeight, active = tru
       </View>
     </View>
   );
-}
+});
 
 // ─── Media Grid (FlatList rows) ───────────────────────────────────────────
 
@@ -1140,7 +1172,7 @@ type GridRow =
  * they are only created for the featured billboard and the wallpaper you
  * select. Video cards render a placeholder so FlatList can keep rows cheap.
  */
-function WallpaperCard({
+const WallpaperCard = React.memo(function ({
   wallpaper,
   onSelect,
 }: {
@@ -1162,13 +1194,13 @@ function WallpaperCard({
             ]}>
             <BatteryFluidPreview level={60} charging={false} compact />
           </View>
-        ) : wallpaper.kind === 'pixel' ? (
+        ) : wallpaper.kind === 'membrane' ? (
           <View
             style={[
               styles.gridMedia,
-              { alignItems: 'center', justifyContent: 'center', backgroundColor: '#060A10' },
+              { alignItems: 'center', justifyContent: 'center', backgroundColor: '#020610' },
             ]}>
-            <PixelArtPreview compact />
+            <MembraneFlowPreview compact accent={wallpaper.accent} />
           </View>
         ) : wallpaper.kind === 'static' ? (
           <Image
@@ -1193,7 +1225,8 @@ function WallpaperCard({
           <Text style={styles.gridKindText}>
             {wallpaper.kind === 'video'
               ? 'LIVE'
-              : wallpaper.kind === 'battery' || wallpaper.kind === 'pixel'
+              : wallpaper.kind === 'battery' ||
+                  wallpaper.kind === 'membrane'
                 ? 'DYNAMIC'
                 : wallpaper.kind === 'static'
                   ? 'STATIC'
@@ -1207,7 +1240,7 @@ function WallpaperCard({
       <Text style={styles.gridMeta}>{wallpaper.duration}</Text>
     </Pressable>
   );
-}
+});
 
 function buildGridRows(
   section: Section,
@@ -1241,7 +1274,7 @@ const SECTION_TABS: { key: Section; label: string }[] = [
   { key: 'static', label: 'Static' },
 ];
 
-function SectionTabs({
+const SectionTabs = React.memo(function ({
   section,
   onChange,
   liveCount,
@@ -1285,7 +1318,7 @@ function SectionTabs({
       })}
     </View>
   );
-}
+});
 
 // ─── Main App ────────────────────────────────────────────────────────────
 
@@ -1296,6 +1329,7 @@ function App() {
   const [section, setSection] = React.useState<Section>('live');
   const [scrollY, setScrollY] = React.useState(0);
   const [viewportHeight, setViewportHeight] = React.useState(0);
+  const lastScrollCommit = React.useRef(0);
   const [capabilities, setCapabilities] = React.useState<WallpaperCapabilities | null>(null);
   const [pendingApplyId, setPendingApplyId] = React.useState<string | null>(null);
 
@@ -1364,7 +1398,12 @@ function App() {
     [wallpapers],
   );
   const dynamicItems = React.useMemo(
-    () => wallpapers.filter(item => item.kind === 'battery' || item.kind === 'pixel'),
+    () =>
+      wallpapers.filter(
+        item =>
+          item.kind === 'battery' ||
+          item.kind === 'membrane',
+      ),
     [wallpapers],
   );
   const staticItems = React.useMemo(
@@ -1378,6 +1417,13 @@ function App() {
   );
 
   const handleScroll = React.useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    // Throttle scroll-driven state updates (~10/s) — scroll position only
+    // gates the Billboard's active-vs-placeholder media, so re-rendering the
+    // whole app at 60fps for it is wasteful. Reading a ref before committing
+    // also keeps the latest value available across drop-outs.
+    const now = Date.now();
+    if (now - lastScrollCommit.current < 100) return;
+    lastScrollCommit.current = now;
     setScrollY(event.nativeEvent.contentOffset.y);
   }, []);
 
@@ -1412,6 +1458,9 @@ function App() {
     );
   }, []);
 
+  const openDetail = React.useCallback((w: Wallpaper) => setSelectedWallpaper(w), []);
+  const closeDetail = React.useCallback(() => setSelectedWallpaper(null), []);
+
   const renderRow = React.useCallback(
     ({ item }: { item: GridRow }) => {
       if (item.$rowType === 'billboard') {
@@ -1425,7 +1474,7 @@ function App() {
         return (
           <Billboard
             wallpapers={billboardItems}
-            onSelect={setSelectedWallpaper}
+            onSelect={openDetail}
             scrollY={scrollY}
             viewportHeight={viewportHeight}
             active={selectedWallpaper === null}
@@ -1443,12 +1492,12 @@ function App() {
       return (
         <View style={styles.gridRow}>
           {item.cards.map(card => (
-            <WallpaperCard key={card.id} wallpaper={card} onSelect={setSelectedWallpaper} />
+            <WallpaperCard key={card.id} wallpaper={card} onSelect={openDetail} />
           ))}
         </View>
       );
     },
-    [section, liveItems, dynamicItems, staticItems, scrollY, viewportHeight, selectedWallpaper],
+    [section, liveItems, dynamicItems, staticItems, scrollY, viewportHeight, selectedWallpaper, openDetail],
   );
 
   return (
@@ -1524,7 +1573,7 @@ function App() {
 
       <WallpaperDetailModal
         wallpaper={selectedWallpaper}
-        onClose={() => setSelectedWallpaper(null)}
+        onClose={closeDetail}
         onApplied={handleApplied}
         onWallpaperUpdated={handleWallpaperUpdated}
         onPickerOpened={handlePickerOpened}

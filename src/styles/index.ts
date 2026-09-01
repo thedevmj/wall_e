@@ -339,6 +339,13 @@ const styles = StyleSheet.create({
     padding: 22,
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.16)',
+    maxHeight: '88%',
+  },
+  modalScrollContent: {
+    paddingBottom: 8,
+  },
+  modalScroll: {
+    flexShrink: 1,
   },
   modalTitle: {
     color: '#F0F8FF',

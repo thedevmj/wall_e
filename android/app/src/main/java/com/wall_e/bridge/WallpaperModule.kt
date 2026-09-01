@@ -277,9 +277,9 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     @ReactMethod
-    fun applyWallpaper(id: String, kind: String, destination: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, rotation: Int, promise: Promise) {
+    fun applyWallpaper(id: String, kind: String, destination: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, rotation: Int, accent: String, promise: Promise) {
         try {
-            Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio, rotation=$rotation")
+            Log.i(TAG, "applyWallpaper called: id=$id, kind=$kind, destination=$destination, uri=$videoUri, loop=$loop, duration=$playbackDuration, audio=$audio, rotation=$rotation, accent=$accent")
 
             if (kind == "static") {
                 applyStaticWallpaper(id, videoUri, destination) { ok, error, errorCode ->
@@ -298,18 +298,19 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
-            // The battery fluid wallpaper is fully self-contained (reads battery +
-            // sensors natively) and needs no media URI, rotation, or loop config.
-            // It flows through the same live-wallpaper confirmation path as video.
-            if (kind == "battery" || kind == "pixel") {
-                finishLiveApply(id, kind, destination, "", true, playbackDuration, false, 0, promise)
+            // The battery-fluid and membrane wallpapers are fully self-contained
+            // (battery reads battery+state natively, membrane renders procedurally)
+            // and need no media URI, rotation, or loop config. They flow through the
+            // same live-wallpaper confirmation path as video.
+            if (kind == "battery" || kind == "membrane") {
+                finishLiveApply(id, kind, destination, "", true, playbackDuration, false, 0, accent, promise)
                 return
             }
 
             val normalizedRotation = rotation.coerceIn(0, 270)
             if (normalizedRotation == 0) {
                 val mediaUri = resolveMediaUri(videoUri, "bundled_video", "mp4")
-                finishLiveApply(id, kind, destination, mediaUri.toString(), loop, playbackDuration, audio, 0, promise)
+                finishLiveApply(id, kind, destination, mediaUri.toString(), loop, playbackDuration, audio, 0, accent, promise)
                 return
             }
 
@@ -319,10 +320,10 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                     val rotatedUri = rotateVideoIfPossible(original, normalizedRotation)
                     if (rotatedUri != null) {
                         Log.i(TAG, "Rotation transcode succeeded; playing pre-rotated file with rotation=0")
-                        finishLiveApply(id, kind, destination, rotatedUri.toString(), loop, playbackDuration, audio, 0, promise)
+                        finishLiveApply(id, kind, destination, rotatedUri.toString(), loop, playbackDuration, audio, 0, accent, promise)
                     } else {
                         Log.w(TAG, "Rotation transcode failed/unavailable; falling back to original with rotation=$normalizedRotation")
-                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, promise)
+                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, accent, promise)
                     }
                 } catch (error: Exception) {
                     Log.e(TAG, "Failed to apply wallpaper (rotation path)", error)
@@ -360,6 +361,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         playbackDuration: Int,
         audio: Boolean,
         rotation: Int,
+        accent: String,
         promise: Promise,
     ) {
         // Write only a *pending* config first; it becomes the committed wallpaper
@@ -371,7 +373,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         // system_server, which a normal install never holds, and it added a code
         // path that could leave wallpaper in a half-set state. The auto-targeted
         // system picker is the reliable path on every Android device.
-        savePreviewConfig(id, kind, mediaUri, loop, playbackDuration, audio, "", rotation)
+        savePreviewConfig(id, kind, mediaUri, loop, playbackDuration, audio, accent, rotation)
         val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
 
         val flags = when (destination.uppercase()) {

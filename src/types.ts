@@ -1,6 +1,6 @@
 import type { ImageSourcePropType } from 'react-native';
 
-export type WallpaperKind = 'doodle' | 'video' | 'static' | 'battery' | 'pixel';
+export type WallpaperKind = 'doodle' | 'video' | 'static' | 'battery' | 'membrane';
 
 export type Wallpaper = {
   id: string;

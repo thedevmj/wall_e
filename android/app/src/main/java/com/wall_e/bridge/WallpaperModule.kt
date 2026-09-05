@@ -206,6 +206,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 pushString("Static image wallpaper")
                 pushString("Animated pixel art wallpaper")
                 pushString("Battery fluid wallpaper")
+                pushString("Fluid animated wallpaper")
                 pushString("Video rotation")
                 pushString("Wallpaper picker")
             }
@@ -298,11 +299,11 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
-            // The battery-fluid and membrane wallpapers are fully self-contained
-            // (battery reads battery+state natively, membrane renders procedurally)
+            // The battery-fluid, membrane, and fluid wallpapers are fully self-contained
+            // (battery reads battery+state natively, membrane and fluid render procedurally)
             // and need no media URI, rotation, or loop config. They flow through the
             // same live-wallpaper confirmation path as video.
-            if (kind == "battery" || kind == "membrane") {
+            if (kind == "battery" || kind == "membrane" || kind == "fluid") {
                 finishLiveApply(id, kind, destination, "", true, playbackDuration, false, 0, accent, promise)
                 return
             }

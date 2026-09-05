@@ -67,13 +67,13 @@ export const BatteryFluidPreview = React.memo(function ({ level = 50, charging =
           toValue: 1,
           duration: 1800,
           easing: Easing.inOut(Easing.sin),
-          useNativeDriver: false,
+          useNativeDriver: true,
         }),
         Animated.timing(pulse, {
           toValue: 0,
           duration: 1800,
           easing: Easing.inOut(Easing.sin),
-          useNativeDriver: false,
+          useNativeDriver: true,
         }),
       ]),
     );
@@ -88,13 +88,13 @@ export const BatteryFluidPreview = React.memo(function ({ level = 50, charging =
           toValue: 1,
           duration: 2600,
           easing: Easing.inOut(Easing.sin),
-          useNativeDriver: false,
+          useNativeDriver: true,
         }),
         Animated.timing(drift, {
           toValue: 0,
           duration: 2600,
           easing: Easing.inOut(Easing.sin),
-          useNativeDriver: false,
+          useNativeDriver: true,
         }),
       ]),
     );
@@ -102,23 +102,18 @@ export const BatteryFluidPreview = React.memo(function ({ level = 50, charging =
     return () => loop.stop();
   }, [drift]);
 
-  /* ── Health-spectrum colour driven by battery level ────────────────────────
-   * Shifts through a full hue range so the level is readable at a glance:
-   *   level 0   → hue −110° (red/orange, urgent)
-   *   level 50% → hue ±0°   (accent / healthy mid)
-   *   level 100%→ hue +130° (fresh cyan-blue, full)
-   * The accent seeds the hue family so the custom colour picker still matters.
+  /* ── Colour follows the chosen accent strictly ──────────────────────────
+   * The fluid is drawn in the exact accent hue the user picked; only
+   * lightness/value and alpha vary (charging brightens it, level changes the
+   * fill height, not the colour). No hue shifting away from the accent.
    */
   const [r, g, b] = hexToRgb(accent || '#22C55E');
   const [accentHue, satRaw] = rgbToHsv(r, g, b);
   const sat = Math.max(0.65, satRaw);
-  const fillRatio = Math.max(0.04, Math.min(1, level / 100));
-  // +240° sweep from −110° to +130° around the accent hue, matching the native ramp.
-  const hue = (((accentHue - 110 + 240 * fillRatio) % 360) + 360) % 360;
   const light = charging ? 60 : 52;
-  const bodyColor = `hsl(${hue}, ${Math.round(sat * 100)}%, ${light}%)`;
-  const deepColor = `hsl(${hue}, ${Math.round(Math.max(50, sat * 110))}%, 32%)`;
-  const topBand = `hsla(${hue}, ${Math.round(Math.min(100, sat * 120))}%, 82%, 0.55)`;
+  const bodyColor = `hsl(${accentHue}, ${Math.round(sat * 100)}%, ${light}%)`;
+  const deepColor = `hsl(${accentHue}, ${Math.round(Math.max(50, sat * 110))}%, 32%)`;
+  const topBand = `hsla(${accentHue}, ${Math.round(Math.min(100, sat * 120))}%, 82%, 0.55)`;
 
   const opac = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.9, charging ? 1 : 0.8] });
   const sway = drift.interpolate({ inputRange: [0, 0.5, 1], outputRange: [-10, 8, -10] });
@@ -136,17 +131,21 @@ export const BatteryFluidPreview = React.memo(function ({ level = 50, charging =
       ]}>
       <Animated.View
         style={[
-          styles.liquid,
-          {
-            height: fillAnim,
-            backgroundColor: bodyColor,
-            borderRadius: baseRadius,
-            opacity: opac,
-            transform: [{ translateX: sway }],
-          },
+          styles.liquidWrap,
+          { opacity: opac, transform: [{ translateX: sway }] },
         ]}>
-        <View style={[styles.liquidBand, { backgroundColor: topBand }]} />
-        <View style={[styles.liquidDeep, { backgroundColor: deepColor }]} />
+        <Animated.View
+          style={[
+            styles.liquid,
+            {
+              height: fillAnim,
+              backgroundColor: bodyColor,
+              borderRadius: baseRadius,
+            },
+          ]}>
+          <View style={[styles.liquidBand, { backgroundColor: topBand }]} />
+          <View style={[styles.liquidDeep, { backgroundColor: deepColor }]} />
+        </Animated.View>
       </Animated.View>
 
       {!compact && (
@@ -160,7 +159,7 @@ export const BatteryFluidPreview = React.memo(function ({ level = 50, charging =
           pointerEvents="none"
           style={[
             styles.chargingGlow,
-            { borderColor: `hsl(${hue}, ${Math.round(Math.min(100, sat * 120))}%, 75%)`, opacity: glow },
+            { borderColor: `hsl(${accentHue}, ${Math.round(Math.min(100, sat * 120))}%, 75%)`, opacity: glow },
           ]}
         />
       )}
@@ -174,6 +173,12 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     borderWidth: 2,
     borderColor: '#1F2937',
+  },
+  liquidWrap: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
   },
   liquid: {
     position: 'absolute',

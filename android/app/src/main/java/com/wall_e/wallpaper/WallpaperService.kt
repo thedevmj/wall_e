@@ -107,11 +107,11 @@ class LiveWallpaperService : WallpaperService() {
         private var videoFailed = false
         private var videoErrorMessage = ""
         private var isPlayerReady = false
-        // Fade-to-black + fade-back-in cycle for one-shot clips. One-shot clips are
-        // rendered through the GL pipeline, and the GL fragment shader blends the
-        // video toward black using fadeAlpha, so the fade is composited on the live
-        // frames with no canvas-over-surface rendering race.
-        private var fadePhase = 0 // 0 idle, 1 fading-out, 2 black-hold, 3 fading-in
+        // Fade-to-black for one-shot clips: play once, then blend the final frame
+        // toward black via fadeAlpha and hold. One-shot clips are rendered through
+        // the GL pipeline, whose fragment shader blends the video toward black, so
+        // the fade is composited on the live frames with no canvas-surface race.
+        private var fadePhase = 0 // 0 idle, 1 fading-out, 2 black-hold, 4 terminal-held-black
         private var fadeAlpha = 0f
         private var fadeTickMs = 0L
         private var oneShotEndSeen = false
@@ -120,9 +120,8 @@ class LiveWallpaperService : WallpaperService() {
         private val fadeTickIntervalMs = 50L
         private val fadeRunnable = object : Runnable {
             override fun run() {
-                synchronized(playerLock) {
-                    if (fadePhase == 0) return
-                    val player = exoPlayer ?: return
+                 synchronized(playerLock) {
+                    if (fadePhase == 0 || fadePhase == 4) return
                     when (fadePhase) {
                         1 -> {
                             val t = (System.currentTimeMillis() - fadeTickMs) / fadeFadeMs.toFloat()
@@ -135,24 +134,14 @@ class LiveWallpaperService : WallpaperService() {
                             fadeAlpha = 1f
                             ensureFadeRendering()
                             if (System.currentTimeMillis() - fadeTickMs >= fadeBlackHoldMs) {
-                                // Restart from the beginning and resume playback while the
-                                // screen is still black, so fresh frames arrive under the
-                                // black as it fades back in.
-                                player.seekTo(0L)
-                                player.play()
-                                fadePhase = 3
-                                fadeTickMs = System.currentTimeMillis()
-                            }
-                            mainHandler.postDelayed(this, fadeTickIntervalMs)
-                        }
-                        3 -> {
-                            val t = (System.currentTimeMillis() - fadeTickMs) / fadeFadeMs.toFloat()
-                            fadeAlpha = 1f - t.coerceIn(0f, 1f)
-                            if (t >= 1f) {
-                                finishFadeCycleLocked(player)
+                                // Played once: end faded to black and hold there. Do NOT
+                                // seek to 0 and replay. Stop the render loop so the surface
+                                // keeps the final black frame (fadeAlpha == 1) without
+                                // wasting battery redrawing.
+                                fadePhase = 4
+                                stopRendering()
                                 return
                             }
-                            ensureFadeRendering()
                             mainHandler.postDelayed(this, fadeTickIntervalMs)
                         }
                     }
@@ -233,17 +222,6 @@ class LiveWallpaperService : WallpaperService() {
         private val membranePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private var membraneGradient: android.graphics.RadialGradient? = null
 
-        // Supernova accents for the membrane wallpaper: a pulsing energetic core
-        // glow plus luminous rays that stream outward. A dedicated ray path and
-        // stroke brush keep per-frame allocations to zero.
-        private val rayPath = Path()
-        private val rayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-        }
-        private val corePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private var coreGradient: android.graphics.RadialGradient? = null
-
         // Membrane renderer cache: the palette colours and unit radial gradients
         // are rebuilt ONLY when the accent hue changes, then positioned each frame
         // through a single reused matrix. This removes ~6 gradient objects and
@@ -254,13 +232,15 @@ class LiveWallpaperService : WallpaperService() {
         private var mbWine: android.graphics.RadialGradient? = null
         private var mbIndigo: android.graphics.RadialGradient? = null
         private var mbBoundary: android.graphics.RadialGradient? = null
-        private var mbCoreGlow: android.graphics.RadialGradient? = null
+        private var mbBloom: android.graphics.RadialGradient? = null
         private var mbVignette: android.graphics.RadialGradient? = null
-        private var mbWhiteHot = 0
-        private var mbPaleHot = 0
-        private var mbHotViolet = 0
-        private var mbRayInner = 0
-        private var mbRayHalo = 0
+
+        // Paint/shader/cache fields for the "fluid" (OnePlus-style) wallpaper.
+        // Multiple translucent radial-gradient blobs drift over a true-black canvas.
+        private val fluidPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private var fluidBlobGradients = arrayOfNulls<android.graphics.RadialGradient>(7)
+        private val fluidMatrix = android.graphics.Matrix()
+        private var fluidCacheHue: Float = Float.NaN
 
         private var fluidGradientRes = 0 // pixel height the cached gradient was built for
         private val batteryReceiver = object : BroadcastReceiver() {
@@ -289,20 +269,17 @@ class LiveWallpaperService : WallpaperService() {
                 val positionUs = if (shouldLoop) {
                     elapsedUs % durationUs
                 } else {
-                    // One-shot loops through a cycle made of play + fade-out + black
-                    // hold + fade-in, so the clip restarts with a fade instead of
-                    // freezing on the last frame. The fade alpha itself is blended in
-                    // drawFrame() using the same cycle.
+                    // One-shot plays the clip exactly once, then fades to black and
+                    // holds (it does not restart). The fallback stays on the last
+                    // frame while the fade alpha (composited in drawFrame) reaches
+                    // black, then marks itself finished so the render loop stops.
                     val fadeUs = oneShotFadeUs
-                    val blackUs = oneShotBlackUs
-                    val cycleUs = durationUs + fadeUs + blackUs + fadeUs
-                    oneShotCycleUs = cycleUs
-                    val pos = elapsedUs % cycleUs
+                    val periodUs = durationUs + fadeUs
+                    oneShotCycleUs = periodUs
+                    val pos = elapsedUs % periodUs
                     when {
                         pos < durationUs -> pos
-                        pos < durationUs + fadeUs -> durationUs - 1L
-                        pos < durationUs + fadeUs + blackUs -> durationUs - 1L
-                        else -> 0L
+                        else -> durationUs - 1L
                     }
                 }
                 try {
@@ -316,9 +293,17 @@ class LiveWallpaperService : WallpaperService() {
                         }
                         frameFallbackFailures = 0
                     }
-                    // One-shot never freezes on the last frame; it keeps cycling so
-                    // the fade-to-black + fade-back-in loop runs continuously.
-                    frameFallbackFinished = false
+                    // One-shot fades the final frame to black and holds; mark finished
+                    // (after a short black hold) so the render loop stops on the black
+                    // frame instead of restarting the clip.
+                    if (shouldLoop) {
+                        frameFallbackFinished = false
+                    } else {
+                        val fadeUs = oneShotFadeUs
+                        val blackUs = oneShotBlackUs
+                        val periodUs = durationUs + fadeUs
+                        frameFallbackFinished = elapsedUs >= periodUs + blackUs
+                    }
                 } catch (error: Exception) {
                     Log.e(TAG, "Frame fallback decode failed at ${positionUs}us", error)
                     frameFallbackFailures++
@@ -704,8 +689,8 @@ class LiveWallpaperService : WallpaperService() {
         /**
          * Starts the fade-out phase for a finished one-shot clip. ExoPlayer is
          * paused first (leaving a static frame on the surface) so the engine canvas
-         * can safely blend the black overlay, then playback restarts with a fade-in.
-         * Must be called while holding playerLock.
+         * can safely blend the black overlay; the clip then fades to black and holds
+         * (it does not restart). Must be called while holding playerLock.
          */
         private fun beginFadeCycleLocked(player: Player) {
             if (fadePhase != 0) return
@@ -718,16 +703,6 @@ class LiveWallpaperService : WallpaperService() {
             fadeTickMs = System.currentTimeMillis() + fadeTickIntervalMs
             refreshRendering()
             mainHandler.postDelayed(fadeRunnable, fadeTickIntervalMs)
-        }
-
-        /** Finishes a fade-in and hands rendering back to live ExoPlayer playback. */
-        private fun finishFadeCycleLocked(player: Player) {
-            fadePhase = 0
-            fadeAlpha = 0f
-            oneShotEndSeen = false
-            player.play()
-            refreshRendering()
-            scheduleEnforceDuration()
         }
 
         private fun ensureFadeRendering() {
@@ -925,9 +900,9 @@ class LiveWallpaperService : WallpaperService() {
 
         /**
          * Black-fade alpha (0..1) for a one-shot clip at the given wall-clock time,
-         * derived from the same play/fade-out/black/fade-in cycle used to pick the
-         * decoded frame in decodeFallbackFrame(). Mirrors that cycle so the overlay
-         * stays in sync with which region of video is being shown.
+         * derived from the same play then fade-out period used to pick the decoded
+         * frame in decodeFallbackFrame(). Mirrors that period so the overlay stays
+         * in sync with which region of video is being shown.
          */
         private fun oneShotFadeAlphaAt(nowMs: Long): Float {
             val cycleUs = oneShotCycleUs
@@ -935,17 +910,12 @@ class LiveWallpaperService : WallpaperService() {
             val durationUs = frameFallbackDurationUs
             if (durationUs <= 0L) return 0f
             val fadeUs = oneShotFadeUs
-            val blackUs = oneShotBlackUs
             val elapsedUs = (nowMs - frameFallbackStartedAt) * 1000L
             val pos = ((elapsedUs % cycleUs) + cycleUs) % cycleUs
+            // Play once, then fade to black and hold (alpha climbs to 1 and stays).
             return when {
                 pos < durationUs -> 0f
-                pos < durationUs + fadeUs -> (pos - durationUs).toFloat() / fadeUs.toFloat()
-                pos < durationUs + fadeUs + blackUs -> 1f
-                else -> {
-                    val t = (pos - (durationUs + fadeUs + blackUs)).toFloat() / fadeUs.toFloat()
-                    1f - t.coerceIn(0f, 1f)
-                }
+                else -> ((pos - durationUs).toFloat() / fadeUs.toFloat()).coerceIn(0f, 1f)
             }
         }
 
@@ -1082,6 +1052,7 @@ class LiveWallpaperService : WallpaperService() {
                 val drawWithCanvas = synchronized(playerLock) {
                     wallpaperKind == "battery" ||
                         wallpaperKind == "membrane" ||
+                        wallpaperKind == "fluid" ||
                         wallpaperKind == "static" ||
                         wallpaperKind == "doodle" ||
                         (wallpaperKind == "video" &&
@@ -1098,7 +1069,7 @@ class LiveWallpaperService : WallpaperService() {
                             // -> seconds). It is monotonic and frame-locked, so the motion
                             // glides smoothly with no accumulated-drift jitter.
                             val animSeconds =
-                                if (wallpaperKind == "battery" || wallpaperKind == "membrane")
+                                if (wallpaperKind == "battery" || wallpaperKind == "membrane" || wallpaperKind == "fluid")
                                     frameTimeNanos / 1e9f
                                 else fluidAnimTimeSec
                             drawFrame(canvas, animSeconds)
@@ -1148,23 +1119,17 @@ class LiveWallpaperService : WallpaperService() {
 
             val fillTop = h - h * fluidDisplayLevel
 
-            // Map the fluid colour to battery "health" across a full spectrum so the
-            // level is readable at a glance: red/orange near empty, green in the
-            // healthy mid-range, and a fresh cyan-blue near full. The chosen accent
-            // seeds the hue family so the custom-colour picker still lands.
+            // Colour strictly follows the chosen accent hue — the fluid is drawn
+            // in the exact accent the user picked. Only value (lightness) and
+            // alpha vary: charging brightens it; the level changes the fill
+            // height, never the colour family.
             val accentHsv = FloatArray(3)
             android.graphics.Color.colorToHSV(accentColor, accentHsv)
-
-            // Build a health ramp in an HSV hue space centred around the accent hue:
-            //   level 0   → hue -110° (roughly red/orange, urgent)
-            //   level 50% → hue +0°  (the accent / healthy mid)
-            //   level 100%→ hue +85° (fresh cyan-blue, full)
-            // Wrapped into [0,360). Saturation is kept high, and only the hue moves.
-            val rampHue = (accentHsv[0] - 110f + 240f * (fluidDisplayLevel.coerceIn(0f, 1f))).let { ((it % 360f) + 360f) % 360f }
+            val accentHue = accentHsv[0]
             val sat = maxOf(0.65f, accentHsv[1])
             val value = if (batteryIsCharging) 0.98f else 0.82f
-            val surfaceColor = Color.HSVToColor(floatArrayOf(rampHue, sat, value))
-            val deepColor = Color.HSVToColor(floatArrayOf(rampHue, 0.9f, value * 0.4f))
+            val surfaceColor = Color.HSVToColor(floatArrayOf(accentHue, sat, value))
+            val deepColor = Color.HSVToColor(floatArrayOf(accentHue, 0.9f, value * 0.4f))
 
             if (h.toInt() != fluidGradientRes) {
                 fluidGradientRes = h.toInt()
@@ -1204,10 +1169,14 @@ class LiveWallpaperService : WallpaperService() {
             canvas.drawPath(surfacePath, fluidFillPaint)
             surfacePath.close()
 
-            // Charging pulse: a soft bright line on the surface.
+            // Charging pulse: a soft bright line on the surface, tinted by accent.
             if (batteryIsCharging) {
                 val pulse = (sin(elapsed * 3.0) * 0.5 + 0.5) * 0.35f + 0.15f
-                fluidBandPaint.color = Color.argb(((255 * pulse).toInt()).coerceIn(0, 255), 180, 255, 190)
+                val bright = Color.HSVToColor(floatArrayOf(accentHue, sat * 0.6f, 1f))
+                val rC = (bright shr 16) and 0xFF
+                val gC = (bright shr 8) and 0xFF
+                val bC = bright and 0xFF
+                fluidBandPaint.color = Color.argb(((255 * pulse).toInt()).coerceIn(0, 255), rC, gC, bC)
                 fluidBandPaint.strokeWidth = h * 0.007f
                 canvas.drawPath(surfacePath, fluidBandPaint)
             }
@@ -1546,7 +1515,7 @@ class LiveWallpaperService : WallpaperService() {
             val pinkR = h * (0.95f + 0.08f * drift(0.33f, 1.0f, 0.2f))
             place(membranePaint, mbPink, pinkCx, pinkCy, pinkR)
             membranePaint.alpha = 255
-            canvas.drawRect(0f, 0f, w, h, membranePaint)
+            canvas.drawCircle(pinkCx, pinkCy, pinkR, membranePaint)
 
             // ---- 2. The deep crimson / wine surface, lower-right ----
             // Darker and atmospheric, merging into the pink region above the sweep.
@@ -1556,7 +1525,7 @@ class LiveWallpaperService : WallpaperService() {
             val wineR = h * (1.0f + 0.06f * drift(0.28f, 2.2f, 3.1f))
             place(membranePaint, mbWine, wineCx, wineCy, wineR)
             membranePaint.alpha = 235
-            canvas.drawRect(0f, 0f, w, h, membranePaint)
+            canvas.drawCircle(wineCx, wineCy, wineR, membranePaint)
 
             // ---- 3. The deep-navy/indigo upper region ----
             // A cool, very dark mass in the upper-left keeps the empty navy top
@@ -1566,7 +1535,7 @@ class LiveWallpaperService : WallpaperService() {
             val indigoR = h * (0.55f + 0.10f * drift(0.38f, 3.6f, 1.5f))
             place(membranePaint, mbIndigo, indigoCx, indigoCy, indigoR)
             membranePaint.alpha = 170
-            canvas.drawRect(0f, 0f, w, h, membranePaint)
+            canvas.drawCircle(indigoCx, indigoCy, indigoR, membranePaint)
 
             // ---- 4. One huge flowing curved boundary ----
             // A single organic curve sweeping from upper-middle down to the lower
@@ -1594,61 +1563,29 @@ class LiveWallpaperService : WallpaperService() {
             membranePaint.alpha = 120
             canvas.drawPath(membranePath, membranePaint)
 
-            // ---- 5. "Moving supernova" core + radiating rays ----
-            // A bright, breathing energy heart with a soft expanding glow, then
-            // a set of luminous rays that stream outward from it — the active,
-            // supernova-like motion layer on top of the calm colour surfaces.
-            val coreX = w * (0.32f + 0.05f * drift(0.5f, 4.0f, 1.1f))
-            val coreY = h * (0.72f + 0.05f * drift(0.44f, 6.2f, 2.4f))
-
-            // Core brightness and size breathe on a slow, audible "heartbeat".
-            val beat = 0.5f + 0.5f * sin(elapsed * 0.9f).toFloat() // 0..1
-            val coreR = w * (0.085f + 0.030f * beat)
-
-            // Soft outer glow that swells around the core.
-            place(corePaint, mbCoreGlow, coreX, coreY, coreR * 3.4f)
-            corePaint.alpha = (110 + 90 * beat).toInt().coerceIn(0, 255)
-            canvas.drawCircle(coreX, coreY, coreR * 3.4f, corePaint)
-
-            // Bright inner heart.
-            corePaint.shader = null
-            corePaint.color = mbWhiteHot
-            corePaint.alpha = (170 + 70 * beat).toInt().coerceIn(0, 255)
-            canvas.drawCircle(coreX, coreY, coreR, corePaint)
-
-            // Radiating rays: each one sways, rotates and pulses independently so
-            // the whole field streams outward like supernova filaments.
-            val rayCount = 12
-            repeat(rayCount) { i ->
-                val base = (i.toFloat() / rayCount) * 2f * Math.PI.toFloat()
-                val rot = base + 0.7f * sin(elapsed * 0.22f + i * 1.7f).toFloat()
-                val sway = 0.6f * sin(elapsed * 0.31f + i * 2.3f).toFloat()
-                val lenBreath = 0.5f + 0.5f * sin(elapsed * 0.40f + i * 1.1f).toFloat()
-                val length = w * (0.45f + 0.95f * lenBreath)
-                val startX = coreX + cos(rot) * coreR
-                val startY = coreY + sin(rot) * coreR
-                val endX = coreX + cos(rot + sway * 0.2f) * length
-                val endY = coreY + sin(rot + sway * 0.2f) * length
-                // A control point off the chord curving each ray into a filament.
-                val mx = (startX + endX) / 2f + cos(sway) * (endY - startY) * 0.22f
-                val my = (startY + endY) / 2f - sin(sway) * (endX - startX) * 0.22f
-
-                rayPath.reset()
-                rayPath.moveTo(startX, startY)
-                rayPath.quadTo(mx, my, endX, endY)
-
-                // Soft luminous halo around the ray.
-                rayPaint.shader = null
-                rayPaint.color = mbRayHalo
-                rayPaint.strokeWidth = w * (0.014f + 0.010f * beat)
-                rayPaint.alpha = (26 + 30 * lenBreath).toInt().coerceIn(0, 90)
-                canvas.drawPath(rayPath, rayPaint)
-
-                // Bright inner filament.
-                rayPaint.color = mbRayInner
-                rayPaint.strokeWidth = w * (0.0035f + 0.0025f * beat)
-                rayPaint.alpha = (120 + 110 * beat).toInt().coerceIn(0, 235)
-                canvas.drawPath(rayPath, rayPaint)
+            // ---- 5. Soft "bloom" — gentle drifting luminous shapes ----
+            // Replaces the old bright supernova heart + radiating rays. No hard or
+            // jarring motion: a few large translucent accent-hue swells drift and
+            // breathe slowly, giving the composition a calm, fluid, OnePlus-like
+            // life where the crimson surfaces rise and fall across the void.
+            val bloomGradients = floatArrayOf(1.05f, 0.85f, 0.6f)
+            val bloomColors = arrayOf(mbPink, mbWine, mbBloom)
+            val bloomBaseX = floatArrayOf(0.40f, 0.68f, 0.52f)
+            val bloomBaseY = floatArrayOf(0.62f, 0.46f, 0.70f)
+            val bloomRadius = floatArrayOf(0.62f, 0.42f, 0.3f)
+            val bloomAlpha = floatArrayOf(110f, 100f, 150f)
+            val bloomCyc = floatArrayOf(26.0f, 34.0f, 22.0f)
+            for (b in 0 until 3) {
+                val bc = bloomGradients[b]
+                val bp = bloomCyc[b]
+                val tC = elapsed % bp
+                val bx = w * (bloomBaseX[b] + 0.06f * drift(bc + 0.1f, b * 1.3f, 2.0f))
+                val by = h * (bloomBaseY[b] + 0.07f * drift(bc + 0.2f, b * 2.1f, 4.2f))
+                val br = h * (bloomRadius[b] + 0.05f * drift(bc + 0.3f, b + 0.7f, 3.1f))
+                val glow = 0.5f + 0.5f * sin(tC / bp * 2f * Math.PI.toFloat()).toFloat()
+                place(membranePaint, bloomColors[b], bx, by, br)
+                membranePaint.alpha = (bloomAlpha[b] * (0.85f + 0.3f * glow)).toInt().coerceIn(0, 255)
+                canvas.drawCircle(bx, by, br, membranePaint)
             }
 
             // ---- Soft vignette to dim the corners and centre the glow ----
@@ -1656,62 +1593,65 @@ class LiveWallpaperService : WallpaperService() {
             canvas.drawRect(0f, 0f, w, h, vignettePaint)
         }
 
-        private fun mbHsv(baseHue: Float, hueOffset: Float, sat: Float, value: Float): Int =
-            android.graphics.Color.HSVToColor(
-                floatArrayOf(((baseHue + hueOffset) % 360f + 360f) % 360f, sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f))
-            )
-
         // Build the membrane palette + unit radial gradients once per accent hue.
         // The gradients are anchored at the origin with unit radius and moved each
         // frame via mbMatrix, so this runs only on accent changes — never per frame.
         private fun mbBuildCache(baseHue: Float) {
-            mbWhiteHot = mbHsv(baseHue, -2f, 0.16f, 1.0f)
-            mbPaleHot = mbHsv(baseHue, -8f, 0.45f, 0.95f)
-            mbHotViolet = mbHsv(baseHue, -22f, 0.6f, 0.7f)
-            mbRayInner = mbHsv(baseHue, -10f, 0.5f, 0.96f)
-            mbRayHalo = mbHsv(baseHue, -20f, 0.55f, 0.78f)
+            // All surfaces stay strictly in the accent hue; only value (lightness),
+            // saturation and alpha vary to build the light/dark surface stack.
+            val hueSat = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, hueSat)
+            val accentSat = hueSat[1]
+            fun mono(value: Float, sat: Float = accentSat): Int =
+                android.graphics.Color.HSVToColor(floatArrayOf(baseHue, sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f)))
 
             fun unit(colors: IntArray, positions: FloatArray) =
                 android.graphics.RadialGradient(0f, 0f, 1f, colors, positions, android.graphics.Shader.TileMode.CLAMP)
 
             mbPink = unit(
                 intArrayOf(
-                    mbHsv(baseHue, -6f, 0.32f, 0.97f),
-                    mbHsv(baseHue, -18f, 0.5f, 0.85f),
-                    mbHsv(baseHue, -30f, 0.62f, 0.62f),
-                    mbHsv(baseHue, -40f, 0.66f, 0.42f),
+                    mono(0.97f, 0.32f),
+                    mono(0.85f, 0.5f),
+                    mono(0.62f, 0.62f),
+                    mono(0.42f, 0.66f),
                     android.graphics.Color.TRANSPARENT
                 ),
                 floatArrayOf(0f, 0.28f, 0.55f, 0.78f, 1f)
             )
             mbWine = unit(
                 intArrayOf(
-                    mbHsv(baseHue, 8f, 0.7f, 0.55f),
-                    mbHsv(baseHue, 10f, 0.78f, 0.38f),
-                    mbHsv(baseHue, 16f, 0.8f, 0.22f),
+                    mono(0.55f, 0.7f),
+                    mono(0.38f, 0.78f),
+                    mono(0.22f, 0.8f),
                     android.graphics.Color.TRANSPARENT
                 ),
                 floatArrayOf(0f, 0.32f, 0.62f, 1f)
             )
             mbIndigo = unit(
                 intArrayOf(
-                    mbHsv(baseHue, -52f, 0.55f, 0.16f),
-                    mbHsv(baseHue, -34f, 0.55f, 0.30f),
+                    mono(0.16f, 0.55f),
+                    mono(0.30f, 0.55f),
                     android.graphics.Color.TRANSPARENT
                 ),
                 floatArrayOf(0f, 0.45f, 1f)
             )
             mbBoundary = unit(
                 intArrayOf(
-                    mbHsv(baseHue, -14f, 0.42f, 0.66f),
-                    mbHsv(baseHue, -34f, 0.6f, 0.4f),
+                    mono(0.66f, 0.42f),
+                    mono(0.4f, 0.6f),
                     android.graphics.Color.TRANSPARENT
                 ),
                 floatArrayOf(0f, 0.5f, 1f)
             )
-            mbCoreGlow = unit(
-                intArrayOf(mbWhiteHot, mbPaleHot, mbHotViolet, android.graphics.Color.TRANSPARENT),
-                floatArrayOf(0f, 0.30f, 0.62f, 1f)
+            // Soft central "bloom" — a gentle luminous swell in the accent hue
+            // that replaces the old bright supernova heart. No hard core, no rays.
+            mbBloom = unit(
+                intArrayOf(
+                    mono(0.90f, 0.28f),
+                    mono(0.72f, 0.42f),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.45f, 1f)
             )
             mbVignette = unit(
                 intArrayOf(android.graphics.Color.TRANSPARENT, android.graphics.Color.argb(150, 0, 3, 14)),
@@ -1720,8 +1660,104 @@ class LiveWallpaperService : WallpaperService() {
             mbCacheHue = baseHue
         }
 
+        /**
+         * OnePlus-style "fluid" wallpaper. True-black canvas with large translucent
+         * radial-gradient blobs that drift, swell and overlap with a soft additive
+         * glow. Deliberately light per frame — the battery approach: a handful of
+         * cheap draw ops, not many layered full-screen composites. Blob colours are
+         * cached as unit gradients and repositioned each frame via matrix.
+         */
+        private fun fluidBuildCache(baseHue: Float) {
+            fun unit(colors: IntArray, positions: FloatArray) =
+                android.graphics.RadialGradient(0f, 0f, 1f, colors, positions, android.graphics.Shader.TileMode.CLAMP)
+
+            // All blobs keep the exact accent hue; only value (lightness) and
+            // alpha vary so the composition stays strictly in the chosen colour.
+            val specs = arrayOf(
+                // [value, alpha]
+                floatArrayOf(0.62f, 0.60f),
+                floatArrayOf(0.42f, 0.50f),
+                floatArrayOf(0.75f, 0.55f),
+            )
+            val accentHsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, accentHsv)
+            val sat = accentHsv[1]
+            fluidBlobGradients = Array(specs.size) { i ->
+                val s = specs[i]
+                val center = android.graphics.Color.HSVToColor(
+                    floatArrayOf(baseHue, sat, s[0].coerceIn(0f, 1f))
+                )
+                val alpha = ((s[1] * 255).toInt()).coerceIn(0, 255)
+                val cRed = (center shr 16) and 0xFF
+                val cGreen = (center shr 8) and 0xFF
+                val cBlue = center and 0xFF
+                val fade = android.graphics.Color.argb(alpha / 2, cRed, cGreen, cBlue)
+                unit(
+                    intArrayOf(fade, android.graphics.Color.argb(alpha, cRed, cGreen, cBlue), android.graphics.Color.TRANSPARENT),
+                    floatArrayOf(0f, 0.55f, 1f)
+                )
+            }
+            fluidCacheHue = baseHue
+        }
+
+        private fun drawFluid(canvas: Canvas, elapsed: Float) {
+            val w = canvas.width.toFloat()
+            val h = canvas.height.toFloat()
+
+            // True OLED black.
+            canvas.drawColor(android.graphics.Color.BLACK)
+
+            val accentHsv = FloatArray(3)
+            android.graphics.Color.colorToHSV(accentColor, accentHsv)
+            val baseHue = accentHsv[0]
+
+            if (fluidCacheHue != baseHue) fluidBuildCache(baseHue)
+
+            // Slow seamless loop; every term a submultiple so it repaints in phase.
+            val loop = 40f
+            val t = elapsed % loop
+            val p = (2f * Math.PI * (t / loop)).toFloat()
+
+            fun drift(a: Float, b: Float, c: Float): Float {
+                return 0.5f * kotlin.math.sin(a * p + b) +
+                    0.3f * kotlin.math.sin(2.0f * a * p + c + 1.7f) +
+                    0.2f * kotlin.math.sin(3.0f * a * p + b * 1.3f)
+            }
+
+            fun place(shader: android.graphics.RadialGradient?, cx: Float, cy: Float, radius: Float) {
+                fluidMatrix.setTranslate(cx, cy)
+                fluidMatrix.preScale(radius, radius)
+                shader?.setLocalMatrix(fluidMatrix)
+                fluidPaint.shader = shader
+            }
+
+            // 3 large blobs — one drawCircle each, positions drifted cheaply. Far
+            // lighter than many stacked full-screen gradients, giving the same
+            // flowing glass look with battery-fluidity.
+            val bases = arrayOf(
+                floatArrayOf(0.24f, 0.22f, 0.95f),
+                floatArrayOf(0.68f, 0.60f, 0.82f),
+                floatArrayOf(0.38f, 0.78f, 0.70f),
+            )
+            val drifts = arrayOf(
+                floatArrayOf(0.35f, 0.0f, 0.4f),
+                floatArrayOf(0.28f, 3.0f, 1.9f),
+                floatArrayOf(0.42f, 4.4f, 0.9f),
+            )
+
+            for (i in bases.indices) {
+                val b = bases[i]
+                val d = drifts[i]
+                val cx = w * (b[0] + 0.05f * drift(d[0], d[1], d[2]))
+                val cy = h * (b[1] + 0.06f * drift(d[1], d[2], d[0]))
+                val radius = h * (b[2] * 0.5f) * (0.94f + 0.14f * sin(d[0] * p + d[2]).toFloat())
+                place(fluidBlobGradients[i], cx, cy, radius)
+                canvas.drawCircle(cx, cy, radius, fluidPaint)
+            }
+        }
+
         private fun drawFrame(canvas: Canvas, animSeconds: Float) {
-            val elapsed = if (wallpaperKind == "battery" || wallpaperKind == "membrane")
+            val elapsed = if (wallpaperKind == "battery" || wallpaperKind == "membrane" || wallpaperKind == "fluid")
                 animSeconds else (System.currentTimeMillis() - startedAt) / 1000f
             val bgColor = Color.parseColor("#020817")
             canvas.drawColor(bgColor)
@@ -1737,6 +1773,11 @@ class LiveWallpaperService : WallpaperService() {
 
             if (wallpaperKind == "membrane") {
                 drawMembrane(canvas, elapsed)
+                return
+            }
+
+            if (wallpaperKind == "fluid") {
+                drawFluid(canvas, elapsed)
                 return
             }
 

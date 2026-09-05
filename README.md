@@ -1,97 +1,123 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# LiveWallpaper Studio
 
-# Getting Started
+An Android live wallpaper app built with React Native. Browse bundled wallpapers, create custom ones from your own videos, preview them with animated previews, and apply them to your home screen, lock screen, or both.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## Features
 
-## Step 1: Start Metro
+- **43 bundled wallpapers** — 23 animated video wallpapers, 20 static images, and 3 procedural dynamic wallpapers
+- **6 wallpaper types** — video, static, doodle, battery, membrane, and fluid
+- **Custom video wallpapers** — pick any MP4/H.264 file from your device
+- **Live animated previews** — see what each wallpaper looks like before applying
+- **Color customization** — adjust the accent color for dynamic wallpapers
+- **Multiple apply destinations** — set to home screen, lock screen, or both
+- **Battery Fluid wallpaper** — animated fluid that reflects your real battery level with color spectrum shifts
+- **Crimson Bloom wallpaper** — premium minimalist flowing translucent surfaces over midnight navy
+- **OnePlus Fluid wallpaper** — large translucent color blobs drifting over true OLED black
+- **OLED-friendly** — true black backgrounds throughout for AMOLED power savings
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Tech Stack
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+| Layer | Technology |
+|---|---|
+| Framework | React Native 0.87.0 (React 19.2.3) |
+| Language | TypeScript 6.0.3 |
+| Native | Kotlin (Android WallpaperService, Media3/ExoPlayer, OpenGL ES 2.0) |
+| Video | react-native-video 6.19.2 |
+| Node | >= 22.11.0 |
 
-```sh
-# Using npm
+## Getting Started
+
+> Requires the [React Native environment setup](https://reactnative.dev/docs/set-up-your-environment) for Android development.
+
+### Install dependencies
+
+```bash
+npm install
+```
+
+### Start Metro bundler
+
+```bash
 npm start
-
-# OR using Yarn
-yarn start
 ```
 
-## Step 2: Build and run your app
+### Build and run on Android
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+In a separate terminal:
 
-### Android
-
-```sh
-# Using npm
+```bash
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
+### Run tests
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
+```bash
+npm test
 ```
 
-Then, and every time you update your native dependencies, run:
+### Lint
 
-```sh
-bundle exec pod install
+```bash
+npm run lint
 ```
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+## Project Structure
 
-```sh
-# Using npm
-npm run ios
+```
+wall_e/
+  App.tsx                     Main screen, modals, all UI state
+  index.js                    React Native entry point
 
-# OR using Yarn
-yarn ios
+  src/
+    types.ts                  Wallpaper type definitions
+    styles/index.ts           Shared StyleSheet
+    data/
+      bundledWallpapers.ts    43 bundled wallpapers (live + static + dynamic)
+    services/
+      wallpaperBridge.ts      Typed wrapper around native module
+      logService.ts           In-memory log capture
+      toast.ts                Android Toast helper
+    components/
+      ActionButton.tsx        Shared primary/secondary button
+      AuraFlowPreview.tsx     JS preview for Aura gradient wallpaper
+      BatteryFluidPreview.tsx JS preview for battery-level fluid wallpaper
+      ColorPicker.tsx         HSV color picker for accent customization
+      FluidFlowPreview.tsx    JS preview for OnePlus-style fluid wallpaper
+      GeometricArt.tsx        Abstract art for billboard/grid thumbnails
+      MembraneFlowPreview.tsx JS preview for Crimson Bloom wallpaper
+      WallpaperCard.tsx       Wallpaper list card
+
+  android/
+    app/src/main/java/com/wall_e/
+      bridge/
+        WallpaperModule.kt        Native module (pickers, apply, battery, clipboard)
+        VideoRotationProcessor.kt On-device GPU video rotation/transcode
+      wallpaper/
+        WallpaperService.kt       Android WallpaperService (ExoPlayer, Canvas, frame fallback)
+        VideoGlRenderer.kt        OpenGL ES video renderer
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+## Wallpaper Types
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+| Type | Description |
+|---|---|
+| `video` | MP4 video loop with configurable duration, audio, and rotation |
+| `static` | Still image set directly as Android wallpaper |
+| `doodle` | Animated Canvas-drawn shapes rendered natively |
+| `battery` | Fluid animation driven by real battery level with health color spectrum |
+| `membrane` | Premium minimalist flowing translucent surfaces over midnight navy |
+| `fluid` | OnePlus-inspired translucent color blobs drifting over true OLED black |
 
-## Step 3: Modify your app
+## How It Works
 
-Now that you have successfully run the app, let's make changes!
+- **JS Preview** — Each dynamic wallpaper type has a React component that approximates the native rendering using `Animated.View` layers, enabling instant preview without waiting for native rendering
+- **Native Rendering** — The Android `WallpaperService` uses `Choreographer` frame callbacks with `Canvas` drawing for procedural wallpapers, and `Media3/ExoPlayer` for video wallpapers
+- **Decoder Resilience** — If hardware decoders fail, the app falls back to `MediaMetadataRetriever` frame extraction painted to Canvas at ~30 FPS
+- **Media Pipeline** — Selected videos are copied from `content://` URIs to app-private `file://` storage to survive the process boundary between the app and wallpaper service
+- **Config Sync** — Wallpaper configuration is shared between JS and native via `SharedPreferences("wallpaper_pref")` with a 1-second polling watchdog that detects config changes made while the system picker is on top
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+## Notes
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+- User-created wallpapers exist only in memory and are lost on app restart
+- Release APK size is ~317 MB due to 43 bundled media assets
+- The `AuraFlowPreview` component exists but is not currently wired into a bundled wallpaper entry

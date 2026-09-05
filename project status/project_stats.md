@@ -27,6 +27,10 @@ The React Native layer is the editor and library UI. The Android layer owns the 
 - Existing Jest app render test passes.
 - There is an existing Jest warning that the process has open asynchronous handles after the test completes; this is not a test assertion failure.
 - Gradle emits existing deprecation warnings for React Native/Android Gradle APIs.
+- The "Doodle" option has been removed from wallpaper creation. Creating a wallpaper now only offers **Video** or **Static** (`App.tsx` no longer exposes a doodle editor kind). The `doodle` *kind* still exists in the type system and native renderer so previously created doodles keep previewing/applying; it is just no longer creatable from the UI.
+- **Crimson Bloom** (membrane) is now a soft OnePlus-fluid-style composition. The bright breathing "supernova" heart and its rotating/pulsing rays were removed in both the JS preview (`MembraneFlowPreview.tsx`) and the native renderer (`drawMembrane`). It is now a few large translucent accent-hue blobs that drift and swell very slowly (22–34 s loops) — no hard or jarring motion, strictly in the chosen accent hue.
+- **Video wallpaper playback stutter fixed**: the GL compositing path (`VideoGlRenderer.kt`) now renders on a dedicated `HandlerThread` instead of the main-thread wallpaper render loop. This removes per-frame hitch/jank in both vertical (rotated) and horizontal orientations for one-shot and rotated clips. `updateSurfaceSize` and `release()` also run on the GL thread for clean EGL ownership.
+- Release APK rebuilt and verified end-to-end after the above changes (see "Recent Changes" section).
 
 ## Important Recent Fix
 
@@ -55,7 +59,7 @@ The wallpaper service receives an app-owned file that remains readable after the
 
 - `App.tsx`
   - Main screen and all current UI state.
-  - `CreateWallpaperModal`: creates doodle/video wallpapers, selects video, sets title, loop, audio, and duration.
+  - `CreateWallpaperModal`: creates video/static wallpapers (the doodle option was removed), selects video, sets title, loop, audio, and duration.
   - `WallpaperDetailModal`: previews a wallpaper, can select/replace a video, and applies or opens the system wallpaper picker.
   - `AnimatedPreview`: animated doodle preview using React Native `Animated`.
   - Uses `wallpaperBridge` for all native operations.
@@ -329,3 +333,26 @@ Added two animated pixel-art dynamic wallpapers (a new `pixel` kind) plus the pl
 - `src/components/AuraFlowPreview.tsx`: JS approximation (dark canvas + 3 drifting translucent orbs, all `useNativeDriver: false`); `App.tsx` routes the accent `#4A148C` pixel wallpapers to it in the detail preview, `WallpaperMedia`, and `WallpaperCard`, with a matching hint text.
 
 Verification: `tsc --noEmit` clean; `:app:compileDebugKotlin` clean; Jest `PASS (1) FAIL (0)`; release APK rebuilt at `android/app/build/outputs/apk/release/app-release.apk` (~316.9 MB) with the JS bundle inside.
+
+## Recent Changes — Doodle removal, Crimson Bloom fluid rebuild & video stutter fix (this round)
+
+### 1. Doodle creation option removed
+- `App.tsx`: `CreateWallpaperModal` no longer offers the Doodle renderer. The editor kind type narrowed from `'doodle' | 'video' | 'static'` to `'video' | 'static'`, the default changed from `doodle` to `video`, the Doodle button was dropped from the `kindRow`, and the doodle branches in `handleCreate` (name/description/accent/duration) were removed.
+- The `doodle` *kind* is intentionally retained in `WallpaperKind`, `WallpaperService`, and the bundle so any wallpaper created before this change still previews and applies through the native doodle renderer. Only new creation via the UI is blocked.
+
+### 2. Crimson Bloom → soft OnePlus-fluid style (both preview and native)
+Removed the "hard" supernova animation (bright white breathing core + 10 rotating/pulsing radiating rays) and replaced it with calm, slow, fluid-like motion:
+- **JS preview** (`src/components/MembraneFlowPreview.tsx`): fully rewritten as 4 large translucent blobs in the exact accent hue (only value/alpha vary) that drift and swell over a 30 s in/out-sine loop, plus a soft central bloom highlight. One `Animated.Value` + one `Animated.View` per blob, all motion via transforms/opacity with `useNativeDriver: true`.
+- **Native renderer** (`drawMembrane` in `WallpaperService.kt`): the core + rays block is gone, replaced by a "soft bloom" pass — 3 large accent-hue radial-gradient swells (using the cached `mbPink`/`mbWine` + a new `mbBloom` gradient) that drift and breathe slowly (22–34 s cycles). Removed the now-unused paint/cache fields (`rayPath`, `rayPaint`, `corePaint`, `coreGradient`, `mbCoreGlow`, `mbWhiteHot`, `mbPaleHot`, `mbHotViolet`, `mbRayInner`, `mbRayHalo`) and the per-frame "heartbeat" `beat`.
+
+### 3. Video wallpaper stutter fix (GL render off the main thread)
+- `android/app/src/main/java/com/wall_e/wallpaper/VideoGlRenderer.kt`: the compositing pass (texture update, draw, EGL swap) now executes on a dedicated background `HandlerThread` instead of the main-thread wallpaper `doFrame` loop. `render()` just decides whether a new frame/fade is pending and posts the work; `updateSurfaceSize` and `release()` are also posted to the GL thread so EGL context/surface teardown happens on the owning thread.
+- Result: removed the per-frame hitch where every decoded video frame competed with the UI thread — playback is smoother for both vertical (rotated) and horizontal videos that go through the GL path (rotated or one-shot clips). Non-rotated looping clips still render directly through ExoPlayer to the surface (loop already off on the main path).
+
+Verification: `tsc --noEmit` clean; `rtk lint` clean of new issues (only pre-existing inline-style / exhaustive-deps warnings); `:app:compileDebugKotlin` clean; `:app:assembleRelease` **BUILD SUCCESSFUL**. Release APK rebuilt at `android/app/build/outputs/apk/release/app-release.apk` (~302 MB, debug-signed) and ready to copy to the device.
+
+Quick recap of where things stand:
+- Doodle removed from wallpaper creation (Video/Static only)
+- Crimson Bloom rebuilt as soft OnePlus-fluid style (JS + native)
+- Video GL rendering moved to a dedicated thread (stutter fix)
+- Release APK rebuilt and ready at android/app/build/outputs/apk/release/app-release.apk (~302 MB)

@@ -664,6 +664,16 @@ export const dynamicWallpapers: Wallpaper[] = [
     duration: 'Live',
     createdAt: 'Bundled',
   },
+  {
+    id: 'dynamic-fluid',
+    title: 'OnePlus Fluid',
+    kind: 'fluid',
+    description: 'OnePlus-inspired animated fluid. Large translucent colour blobs drift, morph and overlap over true OLED black, creating an organic glass-like flowing composition. Customise the accent to shift the entire palette.',
+    accent: '#00B0FF',
+    status: 'Ready',
+    duration: 'Live',
+    createdAt: 'Bundled',
+  },
 ];
 
 export const bundledWallpapers: Wallpaper[] = [

@@ -120,7 +120,7 @@ export const wallpaperBridge = {
 
   async applyWallpaper(
     id: string,
-    kind: 'doodle' | 'video' | 'static' | 'battery' | 'membrane',
+    kind: 'doodle' | 'video' | 'static' | 'battery' | 'membrane' | 'fluid',
     destination: 'HOME' | 'LOCK' | 'BOTH',
     videoUri?: string,
     loop = true,

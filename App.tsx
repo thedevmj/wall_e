@@ -28,6 +28,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ActionButton } from './src/components/ActionButton';
 import { BatteryFluidPreview } from './src/components/BatteryFluidPreview';
 import { ColorPicker } from './src/components/ColorPicker';
+import { FluidFlowPreview } from './src/components/FluidFlowPreview';
 import { MembraneFlowPreview } from './src/components/MembraneFlowPreview';
 import { GeometricArt } from './src/components/GeometricArt';
 import { bundledWallpapers } from './src/data/bundledWallpapers';
@@ -96,7 +97,7 @@ type CreateModalProps = {
 };
 
 function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps) {
-  const [editorKind, setEditorKind] = React.useState<'doodle' | 'video' | 'static'>('doodle');
+  const [editorKind, setEditorKind] = React.useState<'video' | 'static'>('video');
   const [title, setTitle] = React.useState('');
   const [videoUri, setVideoUri] = React.useState<string | null>(null);
   const [imageUri, setImageUri] = React.useState<string | null>(null);
@@ -189,20 +190,18 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       setErrorMessage('Choose an image before creating this wallpaper.');
       return;
     }
-    const name = title.trim() || (editorKind === 'doodle' ? 'Untitled Doodle' : editorKind === 'video' ? 'Untitled Video' : 'Untitled Image');
+    const name = title.trim() || (editorKind === 'video' ? 'Untitled Video' : 'Untitled Image');
     const newWallpaper: Wallpaper = {
       id: `${editorKind}-${Date.now()}`,
       title: name,
       kind: editorKind,
       description:
-        editorKind === 'doodle'
-          ? 'A custom animated doodle loop.'
-          : editorKind === 'video'
-            ? 'A custom muted video wallpaper loop.'
-            : 'A custom still image wallpaper.',
-      accent: editorKind === 'doodle' ? '#22D3EE' : editorKind === 'video' ? '#FB7185' : '#F59E0B',
+        editorKind === 'video'
+          ? 'A custom muted video wallpaper loop.'
+          : 'A custom still image wallpaper.',
+      accent: editorKind === 'video' ? '#FB7185' : '#F59E0B',
       status: 'Needs preview',
-      duration: editorKind === 'doodle' ? '15 sec' : editorKind === 'video' ? `${playbackDuration} sec` : 'Still',
+      duration: editorKind === 'video' ? `${playbackDuration} sec` : 'Still',
       createdAt: 'Just now',
       videoUri: editorKind === 'video' ? videoUri ?? undefined : undefined,
       imageUri: editorKind === 'static' ? imageUri ?? undefined : undefined,
@@ -338,13 +337,13 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
             </>
           )}
           <View style={styles.kindRow}>
-            {(['doodle', 'video', 'static'] as const).map(kind => (
+            {(['video', 'static'] as const).map(kind => (
               <Pressable
                 key={kind}
                 onPress={() => setEditorKind(kind)}
                 style={[styles.kindButton, editorKind === kind && styles.kindButtonSelected]}>
                 <Text style={styles.kindButtonText}>
-                  {kind === 'doodle' ? 'Doodle' : kind === 'video' ? 'Video' : 'Static'}
+                  {kind === 'video' ? 'Video' : 'Static'}
                 </Text>
               </Pressable>
             ))}
@@ -655,9 +654,10 @@ const WallpaperDetailModal = React.memo(function ({
           <View style={styles.previewStage}>
             <View style={styles.previewBadge} pointerEvents="none">
               <Text style={styles.previewBadgeText}>
-                {wallpaper.kind === 'video' ||
+                {                wallpaper.kind === 'video' ||
                 wallpaper.kind === 'battery' ||
-                wallpaper.kind === 'membrane'
+                wallpaper.kind === 'membrane' ||
+                wallpaper.kind === 'fluid'
                   ? 'LIVE PREVIEW'
                   : 'PREVIEW'}
               </Text>
@@ -744,6 +744,10 @@ const WallpaperDetailModal = React.memo(function ({
           ) : wallpaper.kind === 'membrane' ? (
             <View style={styles.preview}>
               <MembraneFlowPreview accent={wallpaper.accent} />
+            </View>
+          ) : wallpaper.kind === 'fluid' ? (
+            <View style={styles.preview}>
+              <FluidFlowPreview accent={wallpaper.accent} />
             </View>
           ) : (
             <AnimatedPreview accent={wallpaper.accent} />
@@ -838,7 +842,15 @@ const WallpaperDetailModal = React.memo(function ({
             </Text>
           )}
 
-          {(wallpaper.kind === 'battery' || wallpaper.kind === 'membrane') && (
+          {wallpaper.kind === 'fluid' && (
+            <Text style={styles.staticHint}>
+              OnePlus-inspired animated fluid. Large translucent colour blobs drift, morph
+              and overlap over true OLED black, creating an organic glass-like flowing
+              composition. Customise the accent to shift the entire palette.
+            </Text>
+          )}
+
+          {(wallpaper.kind === 'battery' || wallpaper.kind === 'membrane' || wallpaper.kind === 'fluid') && (
             <>
               <Pressable
                 accessibilityRole="button"
@@ -859,7 +871,8 @@ const WallpaperDetailModal = React.memo(function ({
 
           {(wallpaper.kind === 'video' ||
             wallpaper.kind === 'battery' ||
-            wallpaper.kind === 'membrane') &&
+            wallpaper.kind === 'membrane' ||
+            wallpaper.kind === 'fluid') &&
             !livePickerAvailable && (
               <Text style={styles.unsupportedHint}>
                 This device has no live wallpaper picker, so live wallpapers cannot be applied.
@@ -1064,6 +1077,18 @@ const WallpaperMedia = React.memo(function ({
       </View>
     );
   }
+  if (wallpaper.kind === 'fluid') {
+    return (
+      <View
+        style={[
+          style,
+          styles.doodleFallback,
+          { alignItems: 'center', justifyContent: 'center' },
+        ]}>
+        <FluidFlowPreview compact accent={wallpaper.accent} />
+      </View>
+    );
+  }
   return <LiveThumb key={wallpaper.id} wallpaper={wallpaper} style={style} autoPlay={autoPlay} />;
 });
 
@@ -1202,6 +1227,14 @@ const WallpaperCard = React.memo(function ({
             ]}>
             <MembraneFlowPreview compact accent={wallpaper.accent} />
           </View>
+        ) : wallpaper.kind === 'fluid' ? (
+          <View
+            style={[
+              styles.gridMedia,
+              { alignItems: 'center', justifyContent: 'center', backgroundColor: '#000000' },
+            ]}>
+            <FluidFlowPreview compact accent={wallpaper.accent} />
+          </View>
         ) : wallpaper.kind === 'static' ? (
           <Image
             source={wallpaper.source ?? (wallpaper.imageUri ? { uri: wallpaper.imageUri } : undefined)}
@@ -1226,7 +1259,8 @@ const WallpaperCard = React.memo(function ({
             {wallpaper.kind === 'video'
               ? 'LIVE'
               : wallpaper.kind === 'battery' ||
-                  wallpaper.kind === 'membrane'
+                  wallpaper.kind === 'membrane' ||
+                  wallpaper.kind === 'fluid'
                 ? 'DYNAMIC'
                 : wallpaper.kind === 'static'
                   ? 'STATIC'
@@ -1402,7 +1436,8 @@ function App() {
       wallpapers.filter(
         item =>
           item.kind === 'battery' ||
-          item.kind === 'membrane',
+          item.kind === 'membrane' ||
+          item.kind === 'fluid',
       ),
     [wallpapers],
   );

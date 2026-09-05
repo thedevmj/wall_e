@@ -9,6 +9,7 @@ import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
@@ -88,10 +89,19 @@ class VideoGlRenderer(
     @Volatile
     private var hasFrame = false
 
+    @Volatile
     var framesRendered = 0
         private set
+    @Volatile
     var hasError = false
         private set
+
+    // GL work is executed on a dedicated background thread so the (main-thread)
+    // wallpaper render loop never does heavy surface/texture/EGL operations,
+    // which removes the hitching that occurred when every video frame competed
+    // with the UI thread.
+    private val glThread = HandlerThread("wallpaper-video-gles").apply { start() }
+    private val glHandler = Handler(glThread.looper)
 
     var surfaceTexture: SurfaceTexture? = null
         private set
@@ -132,15 +142,20 @@ class VideoGlRenderer(
     }
 
     fun updateSurfaceSize(width: Int, height: Int) {
-        surfaceWidth = max(width, 1)
-        surfaceHeight = max(height, 1)
-        if (eglDisplay == null || eglSurface == null) return
-        try {
-            if (!eglMakeCurrent()) return
-            GLES20.glViewport(0, 0, surfaceWidth, surfaceHeight)
-        } catch (e: Throwable) {
-            Log.e(TAG, "updateSurfaceSize error", e)
-            hasError = true
+        val w = max(width, 1)
+        val h = max(height, 1)
+        if (surfaceWidth == w && surfaceHeight == h) return
+        surfaceWidth = w
+        surfaceHeight = h
+        glHandler.post {
+            if (eglDisplay == null || eglSurface == null) return@post
+            try {
+                if (!eglMakeCurrent()) return@post
+                GLES20.glViewport(0, 0, surfaceWidth, surfaceHeight)
+            } catch (e: Throwable) {
+                Log.e(TAG, "updateSurfaceSize error", e)
+                hasError = true
+            }
         }
     }
 
@@ -152,24 +167,47 @@ class VideoGlRenderer(
         // blend keeps progressing even while ExoPlayer is paused on a static frame.
         if (!newFrame && fadeAlpha <= 0f) return false
         frameAvailable = false
+        postRender(newFrame)
+        return true
+    }
+
+    /**
+     * Posts the actual GL work to the dedicated render thread. When a fresh
+     * frame is pending we always queue (it must not be dropped); otherwise we
+     * coalesce so a flood of fade updates collapses to a single redraw.
+     */
+    private fun postRender(newFrame: Boolean) {
+        synchronized(renderQueuedLock) {
+            if (renderQueued && !newFrame) return
+            renderQueued = true
+        }
+        glHandler.post {
+            renderQueued = false
+            if (hasError || released) return@post
+            renderGlFrame()
+        }
+    }
+
+    private val renderQueuedLock = Any()
+    @Volatile
+    private var renderQueued = false
+
+    private fun renderGlFrame() {
+        val texture = surfaceTexture ?: return
         try {
             if (!eglMakeCurrent()) {
                 hasError = true
-                return false
+                return
             }
-            if (newFrame || !hasFrame) {
-                texture.updateTexImage()
-                texture.getTransformMatrix(transformMatrix)
-                hasFrame = true
-            }
+            texture.updateTexImage()
+            texture.getTransformMatrix(transformMatrix)
+            hasFrame = true
             drawFrame(transformMatrix)
             eglSwapBuffers()
             framesRendered++
-            return true
         } catch (e: Throwable) {
             Log.e(TAG, "render error", e)
             hasError = true
-            return false
         }
     }
 
@@ -374,29 +412,42 @@ class VideoGlRenderer(
         if (released) return
         released = true
         try {
-            val display = eglDisplay
-            if (display != null) {
+            // Run teardown on the GL thread so EGL destruction happens on the same
+            // thread that owns the context, then quit the thread.
+            val latch = java.util.concurrent.CountDownLatch(1)
+            glHandler.post {
                 try {
-                    EGL14.eglMakeCurrent(display, eglSurface, eglSurface, eglContext)
-                } catch (_: Throwable) {
-                    // best-effort
+                    val display = eglDisplay
+                    if (display != null) {
+                        try {
+                            EGL14.eglMakeCurrent(display, eglSurface, eglSurface, eglContext)
+                        } catch (_: Throwable) {
+                            // best-effort
+                        }
+                        if (textureId != 0) {
+                            GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
+                            textureId = 0
+                        }
+                        if (program != 0) {
+                            GLES20.glDeleteProgram(program)
+                            program = 0
+                        }
+                        eglSurface?.let { EGL14.eglDestroySurface(display, it) }
+                        eglContext?.let { EGL14.eglDestroyContext(display, it) }
+                        EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                        EGL14.eglTerminate(display)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "release error", e)
                 }
-                if (textureId != 0) {
-                    GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
-                    textureId = 0
-                }
-                if (program != 0) {
-                    GLES20.glDeleteProgram(program)
-                    program = 0
-                }
-                eglSurface?.let { EGL14.eglDestroySurface(display, it) }
-                eglContext?.let { EGL14.eglDestroyContext(display, it) }
-                EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-                EGL14.eglTerminate(display)
+                latch.countDown()
             }
-        } catch (e: Throwable) {
-            Log.e(TAG, "release error", e)
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
         } finally {
+            try {
+                glThread.quitSafely()
+            } catch (_: Throwable) {
+            }
             videoSurface?.release()
             videoSurface = null
             surfaceTexture?.release()

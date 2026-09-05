@@ -3,8 +3,6 @@ import { Animated, Easing, StyleSheet, View } from 'react-native';
 
 type Props = { compact?: boolean; accent?: string };
 
-/* ── colour helpers ────────────────────────────────────────────────────── */
-
 function hexToRgb(hex: string): [number, number, number] {
   const clean = hex.replace('#', '');
   const full = clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean;
@@ -16,185 +14,159 @@ function hexToRgb(hex: string): [number, number, number] {
 }
 
 /**
- * A premium "membrane" (Crimson Bloom) approximation made purely from a few
- * enormous translucent animated Views. One huge curved boundary separates a
- * luminous soft pink/lavender field (left/lower) from a deep crimson/wine field
- * (right/lower) over a spacious midnight-navy void (upper/right). On top, a
- * bright breathing "supernova" core emits luminous rays that slowly rotate and
- * stream outward, giving the otherwise calm surfaces an active, moving energy.
+ * "Crimson Bloom" — a soft OnePlus-fluid-style composition built from a handful
+ * of enormous translucent blobs in the chosen accent hue. Unlike the old
+ * "supernova" membrane (bright core + rotating rays), there is no hard or
+ * jarring motion: each blob drifts and swells extremely slowly and seamlessly.
+ *
+ * Performance: one Animated.Value + one Animated.View per blob, all motion via
+ * transforms + opacity with useNativeDriver: true (native UI thread).
  */
 export const MembraneFlowPreview = React.memo(function ({ compact = false, accent = '#E883B0' }: Props) {
   const stageWidth = compact ? 92 : 250;
   const stageHeight = compact ? 150 : 420;
+  const centerX = stageWidth / 2;
+  const centerY = stageHeight / 2;
 
+  const [ar, ag, ab] = hexToRgb(accent);
+
+  // All blobs strictly follow the accent hue; only lightness (value) and alpha
+  // vary.
+  const maxC = Math.max(ar, ag, ab) / 255;
+  const minC = Math.min(ar, ag, ab) / 255;
+  const delta = maxC - minC;
+  let hue = 0;
+  if (delta !== 0) {
+    if (maxC === ar / 255) hue = 60 * (((ag / 255 - ab / 255) / delta) % 6);
+    else if (maxC === ag / 255) hue = 60 * ((ab / 255 - ar / 255) / delta + 2);
+    else hue = 60 * ((ar / 255 - ag / 255) / delta + 4);
+  }
+  if (hue < 0) hue += 360;
+  const sat = delta === 0 ? 0 : maxC === 0 ? 0 : delta / maxC;
+  const hsv = (v: number, a: number) => {
+    const c = sat * v;
+    const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+    const m = v - c;
+    let r2 = 0, g2 = 0, b2 = 0;
+    if (hue < 60) { r2 = c; g2 = x; }
+    else if (hue < 120) { r2 = x; g2 = c; }
+    else if (hue < 180) { g2 = c; b2 = x; }
+    else if (hue < 240) { g2 = x; b2 = c; }
+    else if (hue < 300) { r2 = x; b2 = c; }
+    else { r2 = c; b2 = x; }
+    return `rgba(${Math.round((r2 + m) * 255)}, ${Math.round((g2 + m) * 255)}, ${Math.round((b2 + m) * 255)}, ${a})`;
+  };
+
+  // 4 blobs + 1 soft central bloom highlight.
   const phases = React.useRef([
     new Animated.Value(0),
     new Animated.Value(0),
     new Animated.Value(0),
     new Animated.Value(0),
-    // supernova heartbeat + slow rotation of the rays
-    new Animated.Value(0),
     new Animated.Value(0),
   ]).current;
 
-  const [ar, ag, ab] = hexToRgb(accent);
-  const accentSoft = `rgba(${ar}, ${ag}, ${ab}, 0.42)`;
-
-  // Enormous soft surfaces seeded around the accent. Each is a long, wide
-  // translucent sheet; their borders blend into the neighbours so the only
-  // visual structure is the giant organic curve between the light and dark.
-  const fields: {
-    value: Animated.Value;
-    dur: number;
-    w: number;
-    h: number;
-    color: string;
-    baseX: number;
-    baseY: number;
-    phase: number;
-  }[] = [
-    // deep midnight-navy void (upper, accent-tinted, very dark)
-    { value: phases[0], dur: 34000, w: stageWidth * 1.5, h: stageHeight * 1.1, color: 'rgba(6, 12, 34, 0.95)', baseX: 0.15, baseY: -0.05, phase: 0.0 },
-    // luminous pink/lavender glow (lower-left)
-    { value: phases[1], dur: 40000, w: stageWidth * 1.5, h: stageHeight * 1.05, color: accentSoft, baseX: 0.18, baseY: 0.68, phase: 1.7 },
-    // deep crimson / wine (lower-right)
-    { value: phases[2], dur: 38000, w: stageWidth * 1.3, h: stageHeight * 0.95, color: 'rgba(120, 12, 44, 0.85)', baseX: 0.82, baseY: 0.72, phase: 3.1 },
-    // dominant curved boundary highlight (pale lavender sweep)
-    { value: phases[3], dur: 30000, w: stageWidth * 0.9, h: stageHeight * 1.2, color: 'rgba(216, 180, 254, 0.32)', baseX: 0.4, baseY: 0.42, phase: 4.6 },
-  ];
+  const blobs = React.useMemo(() => {
+    const sizes = [1.05, 0.9, 1.0, 0.78];
+    const baseXs = [0.22, 0.7, 0.42, 0.82];
+    const baseYs = [0.28, 0.62, 0.78, 0.38];
+    const driftAmps = [0.07, 0.06, 0.075, 0.055];
+    const values = [0.32, 0.22, 0.16, 0.28];
+    const alphas = [0.55, 0.5, 0.6, 0.46];
+    return Array.from({ length: 4 }, (_, i) => ({
+      size: stageWidth * sizes[i],
+      color: hsv(values[i], alphas[i]),
+      offsetX: (baseXs[i] - 0.5) * stageWidth,
+      offsetY: (baseYs[i] - 0.5) * stageHeight,
+      drift: stageWidth * driftAmps[i],
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accent, stageWidth, stageHeight]);
 
   React.useEffect(() => {
-    const loops = phases.map((value, i) => {
-      const dur = i < 4 ? fields[i].dur : i === 4 ? 2600 : 14000;
-      const useInOut = i !== 5;
-      return Animated.loop(
-        Animated.timing(value, {
+    const loops = phases.map(v =>
+      Animated.loop(
+        Animated.timing(v, {
           toValue: 1,
-          duration: dur,
-          easing: useInOut ? Easing.inOut(Easing.sin) : Easing.linear,
+          duration: 30000,
+          easing: Easing.inOut(Easing.sin),
           useNativeDriver: true,
         }),
-      );
-    });
-    loops.forEach(loop => loop.start());
-    return () => loops.forEach(loop => loop.stop());
+      ),
+    );
+    loops.forEach(l => l.start());
+    return () => loops.forEach(l => l.stop());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const sheetDefs = fields.map((field, i) => {
-    const translateX = field.value.interpolate({
-      inputRange: [0, 1],
-      outputRange: [
-        field.baseX * stageWidth - field.w * 0.45 - (i % 2 === 0 ? stageWidth * 0.06 : -stageWidth * 0.06),
-        field.baseX * stageWidth - field.w * 0.45 + (i % 2 === 0 ? stageWidth * 0.12 : -stageWidth * 0.12),
-      ],
-    });
-    const translateY = field.value.interpolate({
-      inputRange: [0, 1],
-      outputRange: [
-        field.baseY * stageHeight - field.h * 0.5 - field.h * 0.05,
-        field.baseY * stageHeight - field.h * 0.5 + field.h * 0.05,
-      ],
-    });
-    const scaleX = field.value.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1.15] });
-    const scaleY = field.value.interpolate({ inputRange: [0, 1], outputRange: [1.12, 0.9] });
-    const rotate = field.value.interpolate({
-      inputRange: [0, 1],
-      outputRange: [`${-6 + i * 4}deg`, `${6 + i * 4}deg`],
-    });
-    const radius = field.h / 2;
-    return { field, translateX, translateY, scaleX, scaleY, rotate, radius };
-  });
-
-  // Supernova core: breathes in/out while the radiating rays slowly rotate.
-  const corePulse = phases[4];
-  const raySpin = phases[5];
-  const core = {
-    scale: corePulse.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1.25] }),
-    opacity: corePulse.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1] }),
-  };
-  const spin = raySpin.interpolate({ inputRange: [0, 1], outputRange: ['-20deg', '340deg'] });
-
-  const coreX = stageWidth * 0.34;
-  const coreY = stageHeight * 0.7;
-  const coreR = compact ? 7 : 13;
-  const rayCount = 10;
-  const rayLen = compact ? 26 : 52;
-  const rayCol = `rgba(${Math.min(255, ar + 40)}, ${Math.min(255, ag + 40)}, ${Math.min(255, ab + 40)}, 0.55)`;
-
-  const rayAngles = Array.from({ length: rayCount }, (_, i) => (i / rayCount) * 360);
+  // Soft breathing bloom highlight near the centre, gently swelling in value.
+  const bloomValue = phases[4];
+  const bloomScale = bloomValue.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1.2] });
+  const bloomOpacity = bloomValue.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.35, 0.7, 0.35] });
 
   return (
-    <View
-      style={[
-        styles.stage,
-        { width: stageWidth, height: stageHeight, backgroundColor: '#020610' },
-      ]}>
-      {sheetDefs.map((s, i) => (
-        <Animated.View
-          key={i}
-          pointerEvents="none"
-          style={[
-            styles.sheet,
-            {
-              width: s.field.w,
-              height: s.field.h,
-              borderRadius: s.radius,
-              backgroundColor: s.field.color,
-              transform: [
-                { translateX: s.translateX },
-                { translateY: s.translateY },
-                { scaleX: s.scaleX },
-                { scaleY: s.scaleY },
-                { rotate: s.rotate },
-              ],
-            },
-          ]}
-        />
-      ))}
-
-      {/* Rotating supernova rays streaming from the core */}
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.rays,
-          { left: coreX, top: coreY, transform: [{ rotate: spin }] },
-        ]}>
-        {rayAngles.map((deg, i) => (
-          <View
+    <View style={[styles.stage, { width: stageWidth, height: stageHeight }]}>
+      {blobs.map((blob, i) => {
+        const baseX = centerX + blob.offsetX;
+        const baseY = centerY + blob.offsetY;
+        const driftX = phases[i].interpolate({
+          inputRange: [0, 0.5, 1],
+          outputRange: [baseX - blob.drift, baseX + blob.drift * 0.9, baseX - blob.drift],
+        });
+        const driftY = phases[i].interpolate({
+          inputRange: [0, 0.5, 1],
+          outputRange: [baseY - blob.drift * 0.7, baseY + blob.drift, baseY - blob.drift * 0.7],
+        });
+        const scale = phases[i].interpolate({
+          inputRange: [0, 0.5, 1],
+          outputRange: [0.9, 1.2, 0.9],
+        });
+        const opacity = phases[i].interpolate({
+          inputRange: [0, 0.5, 1],
+          outputRange: [0.8, 1, 0.8],
+        });
+        return (
+          <Animated.View
             key={i}
+            pointerEvents="none"
             style={[
-              styles.ray,
+              styles.blob,
               {
-                left: -rayLen / 2,
-                top: -1,
-                width: rayLen,
-                backgroundColor: rayCol,
-                opacity: 0.35 + 0.4 * ((i + 1) % 3) / 2,
-                transform: [{ rotate: `${deg}deg` }],
+                width: blob.size,
+                height: blob.size,
+                borderRadius: blob.size / 2,
+                backgroundColor: blob.color,
+                marginLeft: -blob.size / 2,
+                marginTop: -blob.size / 2,
+                opacity,
+                transform: [
+                  { translateX: driftX },
+                  { translateY: driftY },
+                  { scale },
+                ],
               },
             ]}
           />
-        ))}
-      </Animated.View>
+        );
+      })}
 
-      {/* Bright breathing supernova heart */}
+      {/* Soft central bloom highlight */}
       <Animated.View
         pointerEvents="none"
         style={[
-          styles.core,
+          styles.blob,
+          styles.bloom,
           {
-            left: coreX - coreR,
-            top: coreY - coreR,
-            width: coreR * 2,
-            height: coreR * 2,
-            borderRadius: coreR,
-            opacity: core.opacity,
-            transform: [{ scale: core.scale }],
+            width: stageWidth * 0.9,
+            height: stageWidth * 0.9,
+            borderRadius: (stageWidth * 0.9) / 2,
+            left: centerX,
+            top: centerY,
+            opacity: bloomOpacity,
+            transform: [{ scale: bloomScale }],
           },
-        ]}>
-        <View style={[styles.coreInner, { backgroundColor: 'rgba(255,255,255,0.85)' }]} />
-      </Animated.View>
+        ]}
+      />
     </View>
   );
 });
@@ -204,30 +176,16 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     borderWidth: 2,
     borderColor: '#1F2937',
+    backgroundColor: '#05070C',
   },
-  sheet: {
+  blob: {
     position: 'absolute',
     left: 0,
     top: 0,
   },
-  rays: {
-    position: 'absolute',
-    width: 0,
-    height: 0,
-  },
-  ray: {
-    position: 'absolute',
-    height: 2,
-    borderRadius: 1,
-  },
-  core: {
-    position: 'absolute',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  coreInner: {
-    width: '100%',
-    height: '100%',
-    borderRadius: 999,
+  bloom: {
+    backgroundColor: 'rgba(255,255,255,0.10)',
+    marginLeft: 0,
+    marginTop: 0,
   },
 });

@@ -27,6 +27,8 @@ import com.facebook.react.bridge.WritableArray
 import java.io.File
 import java.io.InputStream
 import java.net.URL
+import java.security.MessageDigest
+import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.util.Log
 import java.io.IOException
@@ -88,10 +90,16 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                     Log.i(TAG, "Playable video URI: $playableUri")
                     val durationSeconds = extractVideoDuration(playableUri)
                         ?: throw IllegalArgumentException("The selected file is not a readable video")
+                    val bytes = playableUri.path?.let { File(it).length() } ?: 0L
+                    val digest = sha1File(playableUri)
+                    val posterUri = extractVideoPoster(playableUri)
 
                     val result: WritableMap = Arguments.createMap().apply {
                         putString("uri", playableUri.toString())
                         putDouble("durationSeconds", durationSeconds.toDouble())
+                        putDouble("bytes", bytes.toDouble())
+                        putString("digest", digest)
+                        if (posterUri != null) putString("posterUri", posterUri.toString())
                     }
                     postToUi { promise.resolve(result) }
                 } catch (error: Exception) {
@@ -687,7 +695,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
         Log.i(TAG, "SAVING CONFIG TO SharedPreferences: kind=$kind, path=$videoUri, rotation=$rotation")
 
-        preferences.edit()
+        val editor = preferences.edit()
             .putString("W_ID", id)
             .putString("W_KIND", kind)
             .putString("W_PATH", videoUri)
@@ -696,7 +704,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             .putBoolean("W_AUDIO", audio)
             .putString("W_ACCENT", finalAccent)
             .putInt("W_ROTATION", rotation.coerceIn(0, 270))
-            .commit()
+        writeSequenceKeysIfCached(editor, videoUri)
+        editor.commit()
 
         val check = preferences.getString("W_PATH", "FAILED")
         Log.i(TAG, "VERIFY SAVED PATH: $check")
@@ -714,7 +723,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
         Log.i(TAG, "SAVING PREVIEW CONFIG: kind=$kind, path=$videoUri, rotation=$rotation")
 
-        preview.edit()
+        val editor = preview.edit()
             .putString("W_ID", id)
             .putString("W_KIND", kind)
             .putString("W_PATH", videoUri)
@@ -723,7 +732,8 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             .putBoolean("W_AUDIO", audio)
             .putString("W_ACCENT", finalAccent)
             .putInt("W_ROTATION", rotation.coerceIn(0, 270))
-            .commit()
+        writeSequenceKeysIfCached(editor, videoUri)
+        editor.commit()
 
         // Tag the committed store with the id of the pending live wallpaper so
         // resolvePendingApply knows there is a selection awaiting confirmation.
@@ -846,6 +856,9 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         if (preview.contains("W_AUDIO")) editor.putBoolean("W_AUDIO", preview.getBoolean("W_AUDIO", false))
         if (preview.contains("W_ACCENT")) editor.putString("W_ACCENT", preview.getString("W_ACCENT", "#7C3AED"))
         if (preview.contains("W_ROTATION")) editor.putInt("W_ROTATION", preview.getInt("W_ROTATION", 0))
+        if (preview.contains("W_SEQ_DIR")) editor.putString("W_SEQ_DIR", preview.getString("W_SEQ_DIR", ""))
+        if (preview.contains("W_SEQ_FPS")) editor.putInt("W_SEQ_FPS", preview.getInt("W_SEQ_FPS", 0))
+        if (preview.contains("W_SEQ_FRAMES")) editor.putInt("W_SEQ_FRAMES", preview.getInt("W_SEQ_FRAMES", 0))
         editor.commit()
         preview.edit().clear().commit()
         Log.i(TAG, "Committed pending preview to wallpaper: path=${committed.getString("W_PATH", "")}")
@@ -947,6 +960,308 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             else (durationMs / 1000f).coerceAtLeast(1f)
         } catch (error: Exception) {
             Log.w(TAG, "Could not read selected video metadata", error)
+            null
+        } finally {
+            try {
+                retriever?.release()
+            } catch (_: Exception) {
+                // release() can throw on some devices
+            }
+        }
+    }
+
+    /**
+     * Deletes an app-private media file (the copied videos/images under
+     * filesDir/wallpapers). Content or remote URIs are ignored so we never
+     * delete user-owned document-picker files. Also removes any pre-rotated
+     * variants derived from a video source. Returns the number of files deleted.
+     *
+     * Called by the JS layer when a user wallpaper is deleted or its video is
+     * replaced, so copied videos stop accumulating in app-private storage.
+     */
+    @ReactMethod
+    fun deleteStoredMedia(uri: String, promise: Promise) {
+        Thread {
+            try {
+                if (uri.isBlank()) {
+                    postToUi { promise.resolve(0) }
+                    return@Thread
+                }
+                val parsed = Uri.parse(uri)
+                if (parsed.scheme?.equals("file", ignoreCase = true) != true || parsed.path == null) {
+                    postToUi { promise.resolve(0) }
+                    return@Thread
+                }
+                val wallpapersDir = File(reactContext.filesDir, "wallpapers")
+                val target = File(parsed.path!!)
+                if (!target.absolutePath.startsWith(wallpapersDir.absolutePath)) {
+                    postToUi { promise.resolve(0) }
+                    return@Thread
+                }
+
+                var deleted = 0
+                if (target.exists()) {
+                    if (target.isDirectory) {
+                        // Software playback sequences live in a directory.
+                        deleted += (target.listFiles()?.size ?: 0) + 1
+                        target.deleteRecursively()
+                    } else if (target.delete()) {
+                        deleted++
+                    }
+                }
+                // Clean up any cached pre-rotated copies: rotated_<name>_r<deg>.mp4
+                val rotatedPattern = "rotated_${target.nameWithoutExtension}_r"
+                wallpapersDir.listFiles()?.forEach { sibling ->
+                    if (sibling.isFile && sibling.name.startsWith(rotatedPattern) && sibling.delete()) {
+                        deleted++
+                    }
+                }
+                Log.i(TAG, "deleteStoredMedia: $uri -> deleted=$deleted")
+                postToUi { promise.resolve(deleted) }
+            } catch (error: Exception) {
+                Log.e(TAG, "deleteStoredMedia failed", error)
+                postToUi {
+                    promise.reject("MEDIA_DELETE_ERROR", "Unable to delete stored media: ${error.message}", error)
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Reports the current usage of the app-private wallpapers directory
+     * (copied videos, images, and cached rotated files). The `items` array lets
+     * the JS layer identify orphaned files and enforce a storage quota by
+     * deleting the oldest unreferenced copies.
+     */
+    @ReactMethod
+    fun getWallpaperStorage(promise: Promise) {
+        try {
+            val dir = File(reactContext.filesDir, "wallpapers")
+            var totalBytes = 0L
+            val itemArray: WritableArray = Arguments.createArray()
+            if (dir.exists()) {
+                dir.listFiles()?.filter { it.isFile }?.sortedBy { it.lastModified() }?.forEach { file ->
+                    totalBytes += file.length()
+                    val item: WritableMap = Arguments.createMap().apply {
+                        putString("path", file.absolutePath)
+                        putString("name", file.name)
+                        putDouble("bytes", file.length().toDouble())
+                        putDouble("modified", file.lastModified().toDouble())
+                    }
+                    itemArray.pushMap(item)
+                }
+                // Software playback sequences are directories (JPEG frames +
+                // manifest). Report each as one storage item so the quota keeper
+                // can prune abandoned sequences exactly like orphaned files.
+                dir.listFiles()?.filter { it.isDirectory && it.name.startsWith("seq_") }
+                    ?.sortedBy { it.lastModified() }?.forEach { seq ->
+                        val seqBytes = seq.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                        totalBytes += seqBytes
+                        val modified = File(seq, FrameSequenceExtractor.MANIFEST_NAME)
+                            .takeIf { it.exists() }?.lastModified() ?: seq.lastModified()
+                        val item: WritableMap = Arguments.createMap().apply {
+                            putString("path", seq.absolutePath)
+                            putString("name", seq.name)
+                            putDouble("bytes", seqBytes.toDouble())
+                            putDouble("modified", modified.toDouble())
+                            putBoolean("directory", true)
+                        }
+                        itemArray.pushMap(item)
+                    }
+            }
+            val result: WritableMap = Arguments.createMap().apply {
+                putInt("files", itemArray.size())
+                putDouble("totalBytes", totalBytes.toDouble())
+                putArray("items", itemArray)
+            }
+            promise.resolve(result)
+        } catch (error: Exception) {
+            Log.e(TAG, "getWallpaperStorage failed", error)
+            promise.reject("STORAGE_ERROR", "Unable to read wallpaper storage usage", error)
+        }
+    }
+
+    /**
+     * SHA-1 digest of a file. Used to de-duplicate re-imported videos: when a
+     * user picks the same video again, JS compares this digest with registered
+     * ones and reuses the existing app-private copy instead of keeping a new
+     * duplicate on disk.
+     */
+    private fun sha1File(uri: Uri): String {
+        val file = uri.path?.let { File(it) }
+            ?: return ""
+        try {
+            val messageDigest = MessageDigest.getInstance("SHA-1")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(8192)
+                var read = input.read(buffer)
+                while (read > 0) {
+                    messageDigest.update(buffer, 0, read)
+                    read = input.read(buffer)
+                }
+            }
+            return messageDigest.digest().joinToString("") { "%02x".format(it) }
+        } catch (error: Exception) {
+            Log.w(TAG, "sha1File failed for ${file.absolutePath}", error)
+            return ""
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Software playback frame sequences
+    // -------------------------------------------------------------------------
+
+    /**
+     * Cache of prepared frame sequences keyed by the video file's absolute
+     * path. Populated by [prepareVideoFrameSequence]; consumed by the config
+     * writers so `${W_SEQ_DIR}` etc. reach the wallpaper service.
+     */
+    private val frameSequenceCache = java.util.concurrent.ConcurrentHashMap<String, FrameSequenceInfo>()
+
+    private fun writeSequenceKeysIfCached(editor: android.content.SharedPreferences.Editor, videoUri: String) {
+        val file = absoluteFileFromUri(videoUri) ?: return
+        val info = frameSequenceCache[file.absolutePath] ?: return
+        editor.putString("W_SEQ_DIR", info.dirPath)
+        editor.putInt("W_SEQ_FPS", info.fps)
+        editor.putInt("W_SEQ_FRAMES", info.frames)
+    }
+
+    private fun absoluteFileFromUri(uri: String): File? {
+        if (uri.isBlank()) return null
+        val parsed = Uri.parse(uri)
+        val path = if (parsed.scheme == "file") parsed.path else uri
+        val file = File(path.orEmpty())
+        return if (file.isFile) file else null
+    }
+
+    /** Deterministic sequence directory for a video: seq_<digest10>. */
+    private fun sequenceDirFor(file: File): File {
+        val digest = sha1File(Uri.fromFile(file))
+        val key = if (digest.isNotBlank()) digest.take(10) else Integer.toHexString(file.name.hashCode())
+        return File(File(reactContext.filesDir, "wallpapers"), "seq_$key")
+    }
+
+    private fun readSequenceInfo(dir: File): FrameSequenceInfo? {
+        return try {
+            val manifest = File(dir, FrameSequenceExtractor.MANIFEST_NAME)
+            if (!manifest.exists() || !dir.isDirectory) return null
+            val json = org.json.JSONObject(manifest.readText())
+            FrameSequenceInfo(
+                dir.absolutePath,
+                json.optInt("frames", 0),
+                json.optInt("fps", 24).coerceIn(1, 120),
+                json.optInt("width", 0),
+                json.optInt("height", 0),
+                json.optLong("durationMs", 0),
+            )
+        } catch (error: Exception) {
+            Log.w(TAG, "readSequenceInfo failed for ${dir.absolutePath}", error)
+            null
+        }
+    }
+
+    /**
+     * Extracts the self-owned software playback sequence for a video (JPEG
+     * frames + manifest) if it is not already cached, then records it so any
+     * wallpaper using that video renders smoothly even when no hardware decoder
+     * is available. The heavy decode runs off the UI thread.
+     */
+    @ReactMethod
+    fun prepareVideoFrameSequence(videoUri: String, promise: Promise) {
+        Thread {
+            try {
+                val parsed = Uri.parse(videoUri)
+                var file = absoluteFileFromUri(videoUri)
+                if (file == null) {
+                    val copied = copyVideoToAppStorage(parsed)
+                    file = absFile(copied)
+                }
+                val local = checkNotNull(file)
+                val dir = sequenceDirFor(local)
+                var info = readSequenceInfo(dir)
+                if (info == null) {
+                    info = FrameSequenceExtractor.extract(reactContext, local.absolutePath, dir.absolutePath)
+                }
+                frameSequenceCache[local.absolutePath] = info
+
+                // If this video is currently the live wallpaper, make sure the
+                // engine picks the sequence up on its next config reload.
+                val prefs = reactContext.getSharedPreferences(COMMITTED_PREFS, 0)
+                val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
+                val editors = ArrayList<android.content.SharedPreferences.Editor>()
+                if (absoluteFileFromUri(prefs.getString("W_PATH", "") ?: "")?.absolutePath == local.absolutePath) {
+                    editors.add(prefs.edit())
+                }
+                if (absoluteFileFromUri(preview.getString("W_PATH", "") ?: "")?.absolutePath == local.absolutePath) {
+                    editors.add(preview.edit())
+                }
+                editors.forEach { editor ->
+                    editor.putString("W_SEQ_DIR", info.dirPath)
+                        .putInt("W_SEQ_FPS", info.fps)
+                        .putInt("W_SEQ_FRAMES", info.frames)
+                        .commit()
+                }
+
+                val result: WritableMap = Arguments.createMap().apply {
+                    putString("dir", info.dirPath)
+                    putInt("frames", info.frames)
+                    putInt("fps", info.fps)
+                    putInt("width", info.width)
+                    putInt("height", info.height)
+                    putDouble("durationMs", info.durationMs.toDouble())
+                }
+                postToUi { promise.resolve(result) }
+            } catch (error: Exception) {
+                Log.w(TAG, "prepareVideoFrameSequence failed for $videoUri", error)
+                postToUi {
+                    promise.reject(
+                        "SEQUENCE_PREP_ERROR",
+                        "Unable to prepare software playback: ${error.message}",
+                        error,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun absFile(uri: Uri): File? = uri.path?.let { File(it) }
+
+    /**
+     * Extracts a poster JPEG from the first real video frame and saves it under
+     * filesDir/wallpapers so the React library grid and detail preview can show
+     * a thumbnail for user-imported videos. Returns null when extraction is not
+     * possible (very short/corrupt videos).
+     */
+    private fun extractVideoPoster(uri: Uri): Uri? {
+        var retriever: MediaMetadataRetriever? = null
+        return try {
+            retriever = MediaMetadataRetriever()
+            retriever.setDataSource(reactContext, uri)
+            // Seek ~1s in so the frame is not the black first frame; clamp to the
+            // duration for very short clips.
+            val durationMs = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 1000L
+            val atUs = (if (durationMs >= 2000L) 1_000_000L else 100_000L)
+            val frame = retriever.getFrameAtTime(atUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: return null
+            val file = File(
+                File(reactContext.filesDir, "wallpapers").apply { mkdirs() },
+                "poster_${System.currentTimeMillis()}.jpg"
+            )
+            val ok = file.outputStream().use { out ->
+                frame.compress(Bitmap.CompressFormat.JPEG, 82, out)
+            }
+            frame.recycle()
+            if (!ok || file.length() <= 0L) {
+                file.delete()
+                return null
+            }
+            Log.i(TAG, "Extracted poster: ${file.absolutePath} bytes=${file.length()}")
+            Uri.fromFile(file)
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not extract video poster", error)
             null
         } finally {
             try {

@@ -160,7 +160,11 @@ object VideoRotationProcessor {
             encoderFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             encoderFormat.setInteger(MediaFormat.KEY_FRAME_RATE, sourceFps)
             encoderFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            encoderFormat.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            encoderFormat.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+            // Baseline-profile H.264 is the safest output for device decoders
+            // that ship a broken/limited AVC-decoder advertisement (e.g. some
+            // budget MediaTek/Redmi devices): Android guarantees every device
+            // can decode Baseline, while High-profile streams are optional.
             encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             encoder.configure(encoderFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoderInputSurface = encoder.createInputSurface()

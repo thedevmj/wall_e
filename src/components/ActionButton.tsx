@@ -5,7 +5,7 @@ import { styles } from '../styles';
 type ActionButtonProps = {
   label: string;
   onPress: () => void;
-  tone?: 'primary' | 'secondary';
+  tone?: 'primary' | 'secondary' | 'danger';
   style?: ViewStyle;
   disabled?: boolean;
 };
@@ -26,7 +26,11 @@ export function ActionButton({
       disabled={disabled}
       style={({pressed}) => [
         styles.abButton,
-        tone === 'primary' ? styles.abPrimary : styles.abSecondary,
+        tone === 'primary'
+          ? styles.abPrimary
+          : tone === 'danger'
+            ? styles.abDanger
+            : styles.abSecondary,
         pressed && !disabled && styles.abPressed,
         disabled && { opacity: 0.5 },
         style,

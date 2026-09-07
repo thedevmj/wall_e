@@ -29,6 +29,42 @@ const styles = StyleSheet.create({
   header: {
     paddingBottom: 16,
   },
+  searchInput: {
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    borderRadius: 12,
+    color: '#F0F8FF',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 14,
+    marginTop: 14,
+  },
+  sortRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  sortButton: {
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+  },
+  sortButtonActive: {
+    backgroundColor: 'rgba(34, 211, 238, 0.18)',
+    borderColor: ACCENT,
+  },
+  sortButtonText: {
+    color: 'rgba(240, 248, 255, 0.7)',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  sortButtonTextActive: {
+    color: ACCENT,
+  },
   tabBar: {
     flexDirection: 'row',
     gap: 10,
@@ -735,6 +771,11 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255, 255, 255, 0.08)',
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.12)',
+  },
+  abDanger: {
+    backgroundColor: 'rgba(190, 30, 45, 0.75)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
   },
   abPressed: {
     opacity: 0.85,

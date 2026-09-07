@@ -27,7 +27,11 @@ test('renders wallpaper studio home screen', async () => {
 
   await ReactTestRenderer.act(async () => {
     component = ReactTestRenderer.create(<App />);
-    await Promise.resolve();
+    // Flush the async SQLite repository load (getDB -> getAll promise chain)
+    // plus the capability probe so act has no pending microtasks left.
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+    }
   });
 
   const textNodes = component!.root.findAllByType(require('react-native').Text);

@@ -28,6 +28,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer
+import com.wall_e.bridge.SequencePlayer
 import java.io.File
 import kotlin.math.cos
 import kotlin.math.sin
@@ -171,6 +172,14 @@ class LiveWallpaperService : WallpaperService() {
         private var frameFallbackRunning = false
         private var staticBitmap: android.graphics.Bitmap? = null
         private var frameFallbackFailures = 0
+        // Self-owned software playback: a pre-extracted JPEG frame sequence
+        // (W_SEQ_DIR) written by the app's FrameSequenceExtractor. Used whenever
+        // the device cannot create a video decoder for the wallpaper surface —
+        // the last line of defence that works on every device.
+        private var sequenceDirPath = ""
+        private var sequenceFps = 24
+        private var sequenceFrames = 0
+        private var sequencePlayer: SequencePlayer? = null
 
         // ── Battery fluid (kind == "battery") ─────────────────────────────────
         @Volatile private var batteryPercent = 1f        // 0..1 current charge
@@ -447,6 +456,16 @@ class LiveWallpaperService : WallpaperService() {
                     } else if (shouldLoop && frameFallbackRetriever != null) {
                         frameFallbackRunning = true
                         frameDecoderHandler.post(decodeFallbackFrame)
+                    }
+                    if (sequencePlayer != null) {
+                        // Software sequence playback: replay one-shot clips from
+                        // the start whenever the wallpaper becomes visible again.
+                        if (!shouldLoop) {
+                            frameFallbackStartedAt = System.currentTimeMillis()
+                            frameFallbackFinished = false
+                            frameFallbackRunning = true
+                        }
+                        sequencePlayer?.prime(0)
                     }
                 }
                 if (wallpaperKind == "battery") {
@@ -813,6 +832,7 @@ class LiveWallpaperService : WallpaperService() {
                 if (System.currentTimeMillis() - playerStartedAt <= 4000L) return
             }
             if (frameFallbackRetriever != null) return
+            if (sequencePlayer != null) return
             val videoUri = try {
                 Uri.parse(configuredVideoUriString)
             } catch (e: Exception) {
@@ -827,6 +847,12 @@ class LiveWallpaperService : WallpaperService() {
 
         private fun startFrameFallback(videoUri: Uri) {
             releaseFrameFallback()
+
+            // Prefer the pre-extracted JPEG frame sequence when one exists: it
+            // plays smoothly at the source frame rate (up to 120 fps) with no
+            // dependency on any video decoder session for the wallpaper surface.
+            if (startSequencePlayback()) return
+
             try {
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(this@LiveWallpaperService, videoUri)
@@ -863,7 +889,40 @@ class LiveWallpaperService : WallpaperService() {
             }
         }
 
+        private fun startSequencePlayback(): Boolean {
+            if (sequenceDirPath.isBlank()) return false
+            val player = try {
+                SequencePlayer(sequenceDirPath)
+            } catch (error: Exception) {
+                Log.w(TAG, "Sequence playback could not open ${sequenceDirPath}", error)
+                null
+            }
+            if (player == null || !player.isReady()) {
+                player?.release()
+                return false
+            }
+            sequencePlayer = player
+            synchronized(playerLock) {
+                frameFallbackStartedAt = System.currentTimeMillis()
+                frameFallbackFinished = false
+                frameFallbackRunning = true
+                videoErrorMessage = "Using software frame playback"
+            }
+            player.prime(0)
+            Log.w(
+                TAG,
+                "Starting sequence playback: fps=${player.frameRate()} frames=${player.frameCount()} " +
+                    "${player.frameWidth()}x${player.frameHeight()}",
+            )
+            mainHandler.post { refreshRendering() }
+            return true
+        }
+
         private fun releaseFrameFallback() {
+            sequencePlayer?.let { player ->
+                try { player.release() } catch (_: Exception) {}
+            }
+            sequencePlayer = null
             frameDecoderHandler.removeCallbacks(decodeFallbackFrame)
             frameFallbackRunning = false
             synchronized(frameLock) {
@@ -891,6 +950,31 @@ class LiveWallpaperService : WallpaperService() {
         }
 
         private fun renderFrameFallback(canvas: Canvas): Boolean {
+            val seqPlayer = sequencePlayer
+            if (seqPlayer != null && seqPlayer.isReady()) {
+                val fps = seqPlayer.frameRate().coerceAtLeast(1)
+                val elapsedMs = System.currentTimeMillis() - frameFallbackStartedAt
+                val frameIndex = (elapsedMs * fps / 1000).toInt()
+                val frame = seqPlayer.frameAt(frameIndex)
+                if (frame != null) {
+                    // Do NOT recycle the previous frame here: it may still live in
+                    // the SequencePlayer's LRU cache. The player reclaims evicted
+                    // frames itself on its loader thread.
+                    synchronized(frameLock) { frameFallbackBitmap = frame }
+                    drawRotatedBitmap(canvas, frame)
+                    if (!shouldLoop && frameIndex >= seqPlayer.frameCount()) {
+                        frameFallbackFinished = true
+                        return true
+                    }
+                    return true
+                }
+                // First frames still decoding; show whatever decoded so far.
+                synchronized(frameLock) {
+                    val bitmap = frameFallbackBitmap ?: return false
+                    drawRotatedBitmap(canvas, bitmap)
+                    return true
+                }
+            }
             synchronized(frameLock) {
                 val bitmap = frameFallbackBitmap ?: return false
                 drawRotatedBitmap(canvas, bitmap)
@@ -1057,7 +1141,7 @@ class LiveWallpaperService : WallpaperService() {
                         wallpaperKind == "doodle" ||
                         (wallpaperKind == "video" &&
                             videoGlRenderer == null &&
-                            (videoFailed || videoRotationDegrees % 360 != 0 || frameFallbackBitmap != null || frameFallbackRetriever != null))
+                            (videoFailed || videoRotationDegrees % 360 != 0 || frameFallbackBitmap != null || frameFallbackRetriever != null || sequencePlayer != null))
                 }
 
                 if (drawWithCanvas) {
@@ -1851,6 +1935,10 @@ class LiveWallpaperService : WallpaperService() {
             playbackDuration = preferences.getInt("W_DURATION", 30).coerceIn(1, 30)
             videoRotationDegrees = preferences.getInt("W_ROTATION", 0).coerceIn(0, 270)
 
+            sequenceDirPath = preferences.getString("W_SEQ_DIR", "").orEmpty()
+            sequenceFps = preferences.getInt("W_SEQ_FPS", 24).coerceIn(1, 120)
+            sequenceFrames = preferences.getInt("W_SEQ_FRAMES", 0).coerceAtLeast(0)
+
             val accentStr = preferences.getString("W_ACCENT", "#7C3AED") ?: "#7C3AED"
             accentColor = try { Color.parseColor(accentStr) } catch (_: Exception) { Color.parseColor("#7C3AED") }
 
@@ -1934,7 +2022,7 @@ class LiveWallpaperService : WallpaperService() {
 
         /** Stable signature of the config the engine currently has in memory. */
         private fun currentConfigSignature(): String =
-            "$wallpaperKind|$configuredVideoUriString|$shouldLoop|$includeAudio|$playbackDuration|$videoRotationDegrees|$accentColor"
+            "$wallpaperKind|$configuredVideoUriString|$shouldLoop|$includeAudio|$playbackDuration|$videoRotationDegrees|$accentColor|$sequenceDirPath|$sequenceFps|$sequenceFrames"
 
         /** Signature of the config the engine *should* use, read fresh from disk. */
         private fun expectedConfigSignature(): String {
@@ -1955,7 +2043,10 @@ class LiveWallpaperService : WallpaperService() {
             } catch (_: Exception) {
                 Color.parseColor("#7C3AED")
             }
-            return "$kind|$path|$loop|$audio|$duration|$rotation|$accent"
+            val seqDir = preferences.getString("W_SEQ_DIR", "").orEmpty()
+            val seqFps = preferences.getInt("W_SEQ_FPS", 24).coerceIn(1, 120)
+            val seqFrames = preferences.getInt("W_SEQ_FRAMES", 0).coerceAtLeast(0)
+            return "$kind|$path|$loop|$audio|$duration|$rotation|$accent|$seqDir|$seqFps|$seqFrames"
         }
 
         /** Reload config from disk and rebuild player/renderers without a visibility change. */
@@ -1966,6 +2057,7 @@ class LiveWallpaperService : WallpaperService() {
             val previousAudio = includeAudio
             val previousDuration = playbackDuration
             val previousRotation = videoRotationDegrees
+            val previousSeqDir = sequenceDirPath
 
             loadConfiguration()
             loadStaticImage()
@@ -1976,7 +2068,8 @@ class LiveWallpaperService : WallpaperService() {
                     previousLoop != shouldLoop ||
                     previousAudio != includeAudio ||
                     previousDuration != playbackDuration ||
-                    previousRotation != videoRotationDegrees
+                    previousRotation != videoRotationDegrees ||
+                    previousSeqDir != sequenceDirPath
 
             if (!configChanged) return
 

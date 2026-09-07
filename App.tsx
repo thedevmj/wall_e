@@ -32,7 +32,9 @@ import { FluidFlowPreview } from './src/components/FluidFlowPreview';
 import { MembraneFlowPreview } from './src/components/MembraneFlowPreview';
 import { GeometricArt } from './src/components/GeometricArt';
 import { bundledWallpapers } from './src/data/bundledWallpapers';
+import { wallpaperRepository } from './src/services/wallpaperRepository';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
+import { enforceStorageQuota } from './src/services/storageManager';
 import { copyLogs, startLogCapture, logEvent } from './src/services/logService';
 import { showToast } from './src/services/toast';
 import { styles } from './src/styles';
@@ -100,6 +102,7 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
   const [editorKind, setEditorKind] = React.useState<'video' | 'static'>('video');
   const [title, setTitle] = React.useState('');
   const [videoUri, setVideoUri] = React.useState<string | null>(null);
+  const [pickedVideoPoster, setPickedVideoPoster] = React.useState<string | null>(null);
   const [imageUri, setImageUri] = React.useState<string | null>(null);
   const [videoRotation, setVideoRotation] = React.useState(0);
   const [loopVideo, setLoopVideo] = React.useState(true);
@@ -135,6 +138,7 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
     if (visible) {
       setTitle('');
       setVideoUri(null);
+      setPickedVideoPoster(null);
       setImageUri(null);
       setVideoRotation(0);
       setLoopVideo(true);
@@ -152,7 +156,17 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
     try {
       const pickedVideo = await wallpaperBridge.pickVideo();
       if (pickedVideo) {
-        setVideoUri(pickedVideo.uri);
+        // Reuse the existing app-private copy when this exact video (same
+        // SHA-1 digest) was imported before, and remember its poster frame so
+        // the created wallpaper has a thumbnail.
+        const resolved = await wallpaperRepository.videoFiles.resolvePickedVideo(pickedVideo);
+        // Pre-extract the software-playback frame sequence in the background so
+        // the wallpaper still plays smoothly on devices with no working video
+        // decoder for the wallpaper surface (fire-and-forget; takes a while for
+        // long clips).
+        wallpaperBridge.prepareVideoFrameSequence(resolved.uri).catch(() => undefined);
+        setVideoUri(resolved.uri);
+        setPickedVideoPoster(resolved.posterUri ?? null);
         setPlaybackDuration(Math.min(30, Math.max(1, Math.round(pickedVideo.durationSeconds))));
       } else {
         setErrorMessage('No video was selected. Please try again.');
@@ -205,13 +219,15 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       createdAt: 'Just now',
       videoUri: editorKind === 'video' ? videoUri ?? undefined : undefined,
       imageUri: editorKind === 'static' ? imageUri ?? undefined : undefined,
+      poster:
+        editorKind === 'video' && pickedVideoPoster ? { uri: pickedVideoPoster } : undefined,
       loop: editorKind === 'video' ? loopVideo : undefined,
       audio: editorKind === 'video' ? videoAudio : undefined,
       playbackDuration: editorKind === 'video' ? playbackDuration : undefined,
       rotation: editorKind === 'video' ? videoRotation : undefined,
     };
     onCreated(newWallpaper);
-  }, [editorKind, title, videoUri, imageUri, loopVideo, videoAudio, playbackDuration, videoRotation, onCreated]);
+  }, [editorKind, title, videoUri, pickedVideoPoster, imageUri, loopVideo, videoAudio, playbackDuration, videoRotation, onCreated]);
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -379,6 +395,7 @@ type DetailModalProps = {
   onApplied: (id: string) => void;
   onWallpaperUpdated: (updated: Wallpaper) => void;
   onPickerOpened: (id: string) => void;
+  onDelete?: (wallpaper: Wallpaper) => void;
   livePickerAvailable?: boolean;
 };
 
@@ -388,6 +405,7 @@ const WallpaperDetailModal = React.memo(function ({
   onApplied,
   onWallpaperUpdated,
   onPickerOpened,
+  onDelete,
   livePickerAvailable = true,
 }: DetailModalProps) {
   const [isApplying, setIsApplying] = React.useState(false);
@@ -403,6 +421,7 @@ const WallpaperDetailModal = React.memo(function ({
   const isBundledVideo = wallpaper?.kind === 'video' && wallpaper?.source != null;
   const videoUri = wallpaper?.videoUri ?? '';
   const isRemotePreview = isBundledVideo && videoUri.startsWith('http');
+  const canDelete = wallpaper != null && wallpaperRepository.isPersisted(wallpaper);
 
   const previewRotationStyle = React.useMemo(() => {
     const deg = rotation % 360;
@@ -511,6 +530,12 @@ const WallpaperDetailModal = React.memo(function ({
           wallpaper.accent,
         );
         if (result.ok) {
+          // Prepare the software-playback fallback sequence in the background so
+          // this wallpaper runs on every device, even without a usable video
+          // decoder (extraction is one-time and cached on disk).
+          if (wallpaper.kind === 'video' && mediaUri) {
+            wallpaperBridge.prepareVideoFrameSequence(mediaUri).catch(() => undefined);
+          }
           const directSet =
             result.mode != null && result.mode.startsWith('direct-live-wallpaper');
           // Direct set commits immediately (deterministic). For static wallpapers
@@ -594,12 +619,31 @@ const WallpaperDetailModal = React.memo(function ({
         showToast('No video selected', 'long');
         return;
       }
+      // Reuse an existing app-private copy + thumbnail when this exact video
+      // was imported before, so re-picking never multiplies storage usage.
+      const resolved = await wallpaperRepository.videoFiles.resolvePickedVideo(pickedVideo);
+      wallpaperBridge.prepareVideoFrameSequence(resolved.uri).catch(() => undefined);
       const updatedWallpaper: Wallpaper = {
         ...wallpaper,
-        videoUri: pickedVideo.uri,
+        videoUri: resolved.uri,
+        poster: resolved.posterUri ? { uri: resolved.posterUri } : wallpaper.poster,
         playbackDuration: Math.min(30, Math.max(1, Math.round(pickedVideo.durationSeconds))),
       };
+      // The old copied video (if in app-private storage) becomes orphaned once
+      // the wallpaper points at the new file — release it and deregister its
+      // digest so its poster file can be pruned too.
+      const oldUri = wallpaper.videoUri;
       onWallpaperUpdated(updatedWallpaper);
+      if (oldUri && oldUri !== resolved.uri) {
+        const registered = await wallpaperRepository.videoFiles.findByUri(oldUri);
+        wallpaperBridge.deleteStoredMedia(oldUri).catch(() => undefined);
+        if (registered) {
+          if (registered.posterUri) {
+            wallpaperBridge.deleteStoredMedia(registered.posterUri).catch(() => undefined);
+          }
+          wallpaperRepository.videoFiles.remove(registered.digest).catch(() => undefined);
+        }
+      }
       setVideoError(false);
       showToast('Video selected');
     } catch {
@@ -630,6 +674,18 @@ const WallpaperDetailModal = React.memo(function ({
       showToast('Could not read that image', 'long');
     }
   }, [wallpaper, onWallpaperUpdated]);
+
+  const requestDelete = React.useCallback(() => {
+    if (!wallpaper || !onDelete) return;
+    Alert.alert(
+      'Delete wallpaper',
+      `Are you sure you want to delete "${wallpaper.title}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => onDelete(wallpaper) },
+      ],
+    );
+  }, [wallpaper, onDelete]);
 
   if (!wallpaper) return null;
 
@@ -901,6 +957,14 @@ const WallpaperDetailModal = React.memo(function ({
               onPress={onClose}
               style={styles.modalButton}
             />
+            {canDelete && (
+              <ActionButton
+                label="Delete"
+                tone="danger"
+                onPress={requestDelete}
+                style={styles.modalButton}
+              />
+            )}
           </View>
           {errorMessage && (
             <View style={styles.errorRow}>
@@ -995,6 +1059,21 @@ function LiveThumb({
       <View style={[style, styles.videoPlaceholder]}>
         <GeometricArt accent={wallpaper.accent} size={90} seed={wallpaper.id.length} />
       </View>
+    );
+  }
+
+  // User-imported videos carry an extracted poster frame; static thumbnails
+  // render that JPEG instead of decoding the whole file (which for a large
+  // library would be slow and memory-heavy). Auto-play (billboard) still
+  // decodes the real video.
+  if (!autoPlay && wallpaper.poster) {
+    return (
+      <Image
+        source={wallpaper.poster}
+        resizeMode="cover"
+        resizeMethod="resize"
+        style={style as StyleProp<ImageStyle>}
+      />
     );
   }
 
@@ -1357,7 +1436,7 @@ const SectionTabs = React.memo(function ({
 // ─── Main App ────────────────────────────────────────────────────────────
 
 function App() {
-  const [wallpapers, setWallpapers] = React.useState(bundledWallpapers);
+  const [wallpapers, setWallpapers] = React.useState<Wallpaper[]>(bundledWallpapers);
   const [selectedWallpaper, setSelectedWallpaper] = React.useState<Wallpaper | null>(null);
   const [isCreating, setIsCreating] = React.useState(false);
   const [section, setSection] = React.useState<Section>('live');
@@ -1369,6 +1448,28 @@ function App() {
 
   React.useEffect(() => {
     startLogCapture();
+  }, []);
+
+  // Load persisted user-created wallpapers on mount and merge them with the
+  // bundled (code-defined) library so the library survives app restarts.
+  React.useEffect(() => {
+    let cancelled = false;
+    wallpaperRepository
+      .getAll()
+      .then(merged => {
+        if (!cancelled) {
+          setWallpapers(merged);
+          // Housekeeping on launch: trim orphaned media so storage stays
+          // bounded even across sessions where quota never got a chance.
+          enforceStorageQuota(merged).catch(() => undefined);
+        }
+      })
+      .catch(() => {
+        // Repository already falls back to bundled on error; keep current state.
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Resolve a pending live wallpaper apply once the app returns to the
@@ -1395,11 +1496,12 @@ function App() {
             wallpapersRef.current.find(item => item.id === pendingId)?.title ?? 'Wallpaper';
           showToast(`✓ "${name}" applied`);
           setWallpapers(current =>
-            current.map(item =>
-              item.id === pendingId
-                ? { ...item, status: 'Applied' as const }
-                : item,
-            ),
+            current.map(item => {
+              if (item.id !== pendingId) return item;
+              const updated = { ...item, status: 'Applied' as const };
+              wallpaperRepository.upsert(updated).catch(() => undefined);
+              return updated;
+            }),
           );
         }
         setPendingApplyId(null);
@@ -1427,23 +1529,51 @@ function App() {
   // the Live tab explains the limitation instead of failing silently.
   const livePickerUnavailable = capabilities != null && !capabilities.liveWallpaperPickerAvailable;
 
+  const [searchQuery, setSearchQuery] = React.useState('');
+  const [sortMode, setSortMode] = React.useState<'newest' | 'name'>('newest');
+
+  // Serializable search (title/description/id) + sort (newest first / A–Z)
+  // over the whole library before it is split into sections, so every tab
+  // reflects the same filter.
+  const searchableWallpapers = React.useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    const filtered = query
+      ? wallpapers.filter(
+          item =>
+            item.title.toLowerCase().includes(query) ||
+            item.description.toLowerCase().includes(query) ||
+            item.id.toLowerCase().includes(query),
+        )
+      : wallpapers;
+    if (sortMode === 'name') {
+      return [...filtered].sort((a, b) => a.title.localeCompare(b.title));
+    }
+    return [...filtered].sort((a, b) => {
+      const ta = Date.parse(a.createdAt);
+      const tb = Date.parse(b.createdAt);
+      const na = Number.isNaN(ta) ? 0 : ta;
+      const nb = Number.isNaN(tb) ? 0 : tb;
+      return nb - na;
+    });
+  }, [wallpapers, searchQuery, sortMode]);
+
   const liveItems = React.useMemo(
-    () => wallpapers.filter(item => item.kind === 'video' || item.kind === 'doodle'),
-    [wallpapers],
+    () => searchableWallpapers.filter(item => item.kind === 'video' || item.kind === 'doodle'),
+    [searchableWallpapers],
   );
   const dynamicItems = React.useMemo(
     () =>
-      wallpapers.filter(
+      searchableWallpapers.filter(
         item =>
           item.kind === 'battery' ||
           item.kind === 'membrane' ||
           item.kind === 'fluid',
       ),
-    [wallpapers],
+    [searchableWallpapers],
   );
   const staticItems = React.useMemo(
-    () => wallpapers.filter(item => item.kind === 'static'),
-    [wallpapers],
+    () => searchableWallpapers.filter(item => item.kind === 'static'),
+    [searchableWallpapers],
   );
 
   const rows = React.useMemo(
@@ -1467,19 +1597,28 @@ function App() {
   }, []);
 
   const handleWallpaperCreated = React.useCallback((newWallpaper: Wallpaper) => {
+    wallpaperRepository.upsert(newWallpaper).catch(() => undefined);
     setWallpapers(current => [newWallpaper, ...current]);
     setSelectedWallpaper(newWallpaper);
     setIsCreating(false);
     showToast(`Created "${newWallpaper.title}"`);
+    // Include the brand-new wallpaper (whose file the registry now owns) in the
+    // reference set so quota enforcement never prunes the just-created media.
+    enforceStorageQuota([newWallpaper, ...wallpapersRef.current]).catch(() => undefined);
   }, []);
 
   const handleApplied = React.useCallback((id: string) => {
-    setWallpapers(current =>
-      current.map(item => ({
+    setWallpapers(current => {
+      const next = current.map(item => ({
         ...item,
         status: item.id === id ? ('Applied' as const) : item.status,
-      })),
-    );
+      }));
+      const appliedItem = next.find(item => item.id === id);
+      if (appliedItem) {
+        wallpaperRepository.upsert(appliedItem).catch(() => undefined);
+      }
+      return next;
+    });
   }, []);
 
   const handlePickerOpened = React.useCallback((id: string) => {
@@ -1487,10 +1626,37 @@ function App() {
   }, []);
 
   const handleWallpaperUpdated = React.useCallback((updated: Wallpaper) => {
+    wallpaperRepository.upsert(updated).catch(() => undefined);
     setSelectedWallpaper(updated);
-    setWallpapers(current =>
-      current.map(item => (item.id === updated.id ? updated : item)),
-    );
+    // Re-reference the updated wallpaper so its video/thumbnail survive quota
+    // pruning while any orphaned older copies get cleaned.
+    const next = wallpapersRef.current.map(item => (item.id === updated.id ? updated : item));
+    setWallpapers(next);
+    enforceStorageQuota(next).catch(() => undefined);
+  }, []);
+
+  const handleWallpaperDeleted = React.useCallback((deleted: Wallpaper) => {
+    // Remove copied media + its poster from app-private storage first so
+    // orphaned video files do not accumulate, then drop the row from the
+    // SQLite library and deregister the video digest.
+    const mediaUri = deleted.videoUri ?? deleted.imageUri;
+    if (mediaUri) {
+      wallpaperBridge.deleteStoredMedia(mediaUri).catch(() => undefined);
+      wallpaperRepository.videoFiles.findByUri(mediaUri).then(registered => {
+        if (!registered) return;
+        if (registered.posterUri) {
+          wallpaperBridge.deleteStoredMedia(registered.posterUri).catch(() => undefined);
+        }
+        wallpaperRepository.videoFiles.remove(registered.digest).catch(() => undefined);
+      });
+      // Unreferenced files (incl. the deleted poster) become scrape-able on
+      // the next import, so re-create quota headroom immediately.
+      enforceStorageQuota(wallpapersRef.current).catch(() => undefined);
+    }
+    wallpaperRepository.delete(deleted.id);
+    setWallpapers(current => current.filter(item => item.id !== deleted.id));
+    setSelectedWallpaper(null);
+    showToast(`Deleted "${deleted.title}"`);
   }, []);
 
   const openDetail = React.useCallback((w: Wallpaper) => setSelectedWallpaper(w), []);
@@ -1582,6 +1748,38 @@ function App() {
                   dynamicCount={dynamicItems.length}
                   staticCount={staticItems.length}
                 />
+                <TextInput
+                  accessibilityLabel="Search wallpapers"
+                  placeholder="Search wallpapers..."
+                  placeholderTextColor="#64748B"
+                  value={searchQuery}
+                  onChangeText={setSearchQuery}
+                  style={styles.searchInput}
+                />
+                <View style={styles.sortRow}>
+                  {(
+                    [
+                      { key: 'newest', label: 'Newest' },
+                      { key: 'name', label: 'A–Z' },
+                    ] as const
+                  ).map(option => (
+                    <Pressable
+                      key={option.key}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Sort by ${option.label}`}
+                      accessibilityState={{ selected: sortMode === option.key }}
+                      onPress={() => setSortMode(option.key)}
+                      style={[styles.sortButton, sortMode === option.key && styles.sortButtonActive]}>
+                      <Text
+                        style={[
+                          styles.sortButtonText,
+                          sortMode === option.key && styles.sortButtonTextActive,
+                        ]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
                 {livePickerUnavailable && section === 'live' && (
                   <View accessibilityRole="alert" style={styles.unsupportedBanner}>
                     <Text style={styles.unsupportedBannerTitle}>
@@ -1612,6 +1810,7 @@ function App() {
         onApplied={handleApplied}
         onWallpaperUpdated={handleWallpaperUpdated}
         onPickerOpened={handlePickerOpened}
+        onDelete={handleWallpaperDeleted}
         livePickerAvailable={capabilities?.liveWallpaperPickerAvailable ?? true}
       />
     </ErrorBoundary>

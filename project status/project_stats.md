@@ -11,6 +11,10 @@ The React Native layer is the editor and library UI. The Android layer owns the 
 - React Native app builds from the `wall_e` directory.
 - Android is the supported runtime. iOS files exist because the project was scaffolded, but the wallpaper implementation is Android-only.
 - Doodle rendering is implemented in both the React preview and native wallpaper service.
+- The app's library now persists to SQLite (`@op-engineering/op-sqlite`): user-created video/static wallpapers survive restarts and merge over the bundled (code-defined) catalog. Bundled wallpapers stay code-defined because their `require()` asset ids cannot be serialized.
+- Re-importing the same video is de-duplicated by SHA-1 digest (a `video_files` table keeps the uri of the first copy and reuses it), and app-private storage is kept bounded by a 1 GiB quota manager that prunes unreferenced orphaned files.
+- User-imported videos get a poster thumbnail extracted natively from the first real frame (`poster_*.jpg`), persisted per wallpaper, and the library grid renders that JPEG instead of decoding whole videos; the search field and Newest / A–Z sort apply across every tab.
+- The rotation transcode now outputs **Baseline-profile** H.264, the one AVC profile every Android decoder must support, to dodge broken high-profile decoder advertisements on budget devices.
 - Animated pixel-art wallpapers are implemented natively and in the app: `Pixel Calm` (minimalist teal/ocean, meditative), `Pixel Synthwave` (neon pink/cyan/purple on black, retro-futuristic), and `Aura` (premium flowing deep-purple/lavender gradient on charcoal). All are `pixel`-kind dynamic wallpapers rendered by `WallpaperService.drawPixelArt()` (with `drawAura()` for the gradient variant).
 - Video picking uses Android `ACTION_OPEN_DOCUMENT` with `video/*`.
 - First app launch requests media access:
@@ -60,10 +64,10 @@ The wallpaper service receives an app-owned file that remains readable after the
 - `App.tsx`
   - Main screen and all current UI state.
   - `CreateWallpaperModal`: creates video/static wallpapers (the doodle option was removed), selects video, sets title, loop, audio, and duration.
-  - `WallpaperDetailModal`: previews a wallpaper, can select/replace a video, and applies or opens the system wallpaper picker.
+  - `WallpaperDetailModal`: previews a wallpaper, can select/replace/delete a video, and applies or opens the system wallpaper picker.
   - `AnimatedPreview`: animated doodle preview using React Native `Animated`.
   - Uses `wallpaperBridge` for all native operations.
-  - Wallpaper list is held in component state and is not persisted across app restarts.
+  - Wallpaper library is loaded from SQLite on mount (merged with bundled) and every create/update/delete is persisted, so user-created wallpapers survive app restarts.
 
 - `src/components/ActionButton.tsx`
   - Shared primary/secondary React Native button.
@@ -74,9 +78,9 @@ The wallpaper service receives an app-owned file that remains readable after the
   - Uses an animated accent indicator.
 
 - `src/types.ts`
-  - `WallpaperKind`: `doodle | video | static | battery | pixel`.
-  - `Wallpaper`: UI/library model; optional video URI, loop, audio, and playback duration fields.
-  - `PickedVideo`: `{ uri, durationSeconds }`.
+  - `WallpaperKind`: `doodle | video | static | battery | membrane | fluid`.
+  - `Wallpaper`: UI/library model; optional video URI, loop, audio, title, poster, and playback duration fields.
+  - `PickedVideo`: `{ uri, durationSeconds, digest?, bytes?, posterUri? }` — the digest (SHA-1) powers re-import deduplication, `bytes` feeds the storage quota, and `posterUri` is the extracted thumbnail frame.
   - `WallpaperCapabilities`, `WallpaperApplyResult`, and `WallpaperError` contracts.
 
 - `src/data/mockWallpapers.ts`
@@ -112,13 +116,13 @@ The wallpaper service receives an app-owned file that remains readable after the
 - `android/app/src/main/java/com/wall_e/bridge/WallpaperModule.kt`
   - Exposes `WallpaperModule` to JavaScript.
   - `getCapabilities`: reports live wallpaper support and feature list.
-  - `pickVideo`: starts `ACTION_OPEN_DOCUMENT` for `video/*`, listens for the activity result, persistently attempts read access, copies the selected file into app-private storage, reads duration, and resolves `{ uri, durationSeconds }`.
+  - `pickVideo`: starts `ACTION_OPEN_DOCUMENT` for `video/*`, listens for the activity result, persistently attempts read access, copies the selected file into app-private storage, reads duration, computes a SHA-1 digest of the copy, extracts a poster JPEG from the first frame, and resolves `{ uri, durationSeconds, digest, bytes, posterUri }`.
   - Uses request code `4107` for the video picker.
   - Uses `SharedPreferences` file `wallpaper_pref` for the active wallpaper configuration.
   - `applyWallpaper`: saves config and starts `ACTION_CHANGE_LIVE_WALLPAPER` for the app service. It maps HOME/LOCK/BOTH to Android wallpaper flags for the confirmation flow.
   - `copyVideoToAppStorage`: writes videos under the app internal `filesDir/wallpapers` directory, so no external file path or service URI grant is needed at playback time.
   - The picker result handler now copies the file and reads duration on a background `Thread` and resolves the JS promise via `reactContext.runOnUiQueueThread`, so importing a large video no longer stalls the React preview/UI thread.
-  - Current behavior does not delete old copied videos when a video is replaced or deleted. This is a future storage cleanup task.
+  - On wipe: `deleteStoredMedia(uri)` removes an app-private video plus its `rotated_<name>_r*` variants, and `getWallpaperStorage()` reports per-file usage (path/bytes/modified) so the JS storage quota manager can prune orphaned copies.
 
 - `android/app/src/main/java/com/wall_e/wallpaper/WallpaperService.kt`
   - Android `WallpaperService` implementation.
@@ -233,12 +237,13 @@ The Android compile currently passes. The React Native Jest render test currentl
 
 ## Known Limitations and Follow-up Work
 
-- The app's wallpaper library is in-memory only; user-created wallpapers disappear from the React list after a full app restart.
-- Copied videos accumulate in app-private storage; implement a cleanup policy when replacing/deleting videos or persist a mapping of wallpaper IDs to copied files.
-- Video playback support depends on the device decoder and Media3. MP4/H.264 is the safest compatibility target. A device may advertise H.264 support but still fail hardware decoder initialization; decoder fallback now handles this when an alternate software/device decoder is usable.
-- On the tested Redmi Note 10 / Android 16 / Infinity-X device, both Qualcomm and Android software AVC decoder initialization failed. The frame fallback is the final playback path for that device if `MediaMetadataRetriever` can decode frames.
+- Video playback support depends on the device decoder and Media3. MP4/H.264 Baseline is the safest compatibility target. A device may advertise H.264 support but still fail hardware decoder initialization; Media3 decoder fallback handles this when an alternate software/device decoder is usable.
+- On the tested Redmi Note 10 / Android 16 / Infinity-X device, both the Qualcomm and the Android fallback AVC decoder initialization failed for the hardware surface. The `MediaMetadataRetriever` frame fallback is the final playback path for that device. Mitigations in place: decoder fallback, frame-fallback rendering at the source rate, and the rotation transcode now emitting Baseline-profile H.264 (the profile Android requires every decoder to accept). Fully fixing the capped ~30 FPS frame-fallback rate and refusing to fail the broken decoder would require a software decode pipeline and is hardware/framework-bound, not fixable purely in app code.
 - The native service fallback text is drawn on the Canvas, but React's preview error is separate and may show different details.
-- `SafeAreaView` from `react-native` is deprecated in the current React Native version; migrate to `react-native-safe-area-context` when touching the root layout.
+- Bundled wallpapers are code-defined (their `require()` asset ids cannot be serialized); the DB persists user-created videos/images only. This is by design, not a defect.
+- Applies/status use `SharedPreferences` (`wallpaper_pref`); a full app reinstall wipes library rows and applied state. The system wallpaper survives reinstall only while Android keeps the service plus its stored config.
+- There is no backup/export of the library yet (no cloud sync or `.zip` of wallpapers + media).
+- The SQLite layer adds a `video_files` digest registry plus per-wallpaper `poster_uri`; migration is `idempotent` (guarded `ALTER TABLE`) so existing v1 installs upgrade in place.
 - Gradle reports existing deprecated APIs, including the React Native delegate constructor and legacy variant APIs.
 - The project has existing unrelated worktree modifications in several generated/config/native files. Do not revert them without checking ownership first.
 - No commit should be created unless explicitly requested.
@@ -356,3 +361,74 @@ Quick recap of where things stand:
 - Crimson Bloom rebuilt as soft OnePlus-fluid style (JS + native)
 - Video GL rendering moved to a dedicated thread (stutter fix)
 - Release APK rebuilt and ready at android/app/build/outputs/apk/release/app-release.apk (~302 MB)
+
+## Recent Changes — SQLite persistence, delete, storage quota, dedup, thumbnails, search/sort (this round)
+
+Implements the project-limitation list: a real persistence layer, full copied-media cleanup, storage quota, re-import deduplication, user-video thumbnails, and grid search/sort. Library now scales to a large video library rather than an in-memory demo.
+
+### 1. SQLite persistence (limitation #1)
+- `src/services/db.ts`: `@op-engineering/op-sqlite` database `wall_e.db` (version 2) with `wallpapers`, `meta`, and `video_files` tables plus kind/created indexes. A guarded `ALTER TABLE wallpapers ADD COLUMN poster_uri TEXT;` migrates existing v1 installs in place.
+- `src/services/wallpaperRepository.ts`: single source of truth. `getAll()` merges bundled (code-defined, not serializable) with user-created rows; `getPage()` pages user rows; `upsert`/`delete`/`count` only touch user-created kinds (`video`, `static`). `fromRow`/`toArgs` now carry `poster_uri` so thumbnails survive restarts.
+- `App.tsx`: loads + merges on mount; every create/update/apply/delete persists; `handleWallpaperDeleted` removes the row, the media file, its poster, and its digest entry.
+
+### 2. Delete + copied-media cleanup (limitation #2)
+- Native `WallpaperModule.kt`: `deleteStoredMedia(uri)` wipes an app-private file and all `rotated_<name>_r*` variants; delete/replace flows in `App.tsx` call it so copied videos no longer accumulate.
+- Detail modal gains a Delete button (red `ActionButton` `tone="danger"`, confirm `Alert`), guarded by the `canDelete` prop (user-created only).
+
+### 3. Storage quota guard (limitation #3)
+- Native: `getWallpaperStorage()` now returns a detailed `items: [{path, name, bytes, modified}]` list (oldest-first) plus totals.
+- `src/services/storageManager.ts`: `enforceStorageQuota(wallpapers, maxBytes=1 GiB)` collects every referenced URI (DB `video_uri`s + registered posters + in-memory wallpapers), then prunes oldest **unreferenced** app-private files (`video_`, `image_`, `bundled_*`, `poster_`, `rotated_`). Referenced files are never deleted; rotated caches of a live video are kept via a base-name match. Runs on mount and after create/update/delete.
+
+### 4. Duplicate video detection (limitation #4)
+- Native: `pickVideo` copies the file, computes a SHA-1 digest over it, and returns `digest` + `bytes` with the result.
+- `wallpaperRepository.videoFiles`: `registerFile`/`findByDigest`/`findByUri`/`remove` + `allReferencedUris`. `resolvePickedVideo` reuses the existing app-private copy (and deleted the fresh duplicate + its poster) when a video with the same digest is imported again, so re-picking never doubles storage.
+- Wired into both `chooseVideo` (create) and `chooseVideoForSelected` (replace).
+
+### 5. User-video thumbnails (limitation #9)
+- Native: `extractVideoPoster()` uses `MediaMetadataRetriever.getFrameAtTime(1s, CLOSEST_SYNC)` → `wallpapers/poster_<ts>.jpg`, returned as `posterUri`. Missing/corrupt videos return null gracefully.
+- `Wallpaper` carries `poster` (`{ uri }`), persisted via the new `poster_uri` column. `LiveThumb` and the grid render the poster JPEG (lightweight) instead of decoding the whole video when not auto-playing; the detail preview already honored `poster`.
+
+### 6. Grid search + sort (limitation #8)
+- App header adds a search field (matches title/description/id) and Newest / A–Z sort toggles; applied on the merged library before section filtering, so Live/Dynamic/Static all reflect the same query. New styles: `searchInput`, `sortRow`, `sortButton(Active)`, `sortButtonText(Active)`.
+
+### 7. Decoder-compatibility hardening for #5/#7
+- `VideoRotationProcessor.kt`: the rotation transcode now encodes **Baseline-profile** AVC (`AVCProfileBaseline`) instead of High — Baseline is the profile Android requires every device to decode, so pre-rotated copies win where the original high-profile stream fails on budget decoders. The device-bound #5/#6/#7 items (broken `c2.qti.avc.decoder` init, ~30 FPS frame-fallback cap) remain hardware/framework-limited; existing mitigations (Media3 decoder fallback + `MediaMetadataRetriever` frame fallback) stay in place.
+
+Verification: `tsc --noEmit` clean; Jest `App.test.tsx` PASS (1/1); `rtk lint` introduces no new issues (only the pre-existing inline-style + App.tsx rotation `exhaustive-deps` warnings); `:app:compileDebugKotlin` BUILD SUCCESSFUL (after Kotlin changes).
+
+## Recent Changes — Hybrid Software Playback Engine (this round)
+
+Builds the last major piece of the playback-availability puzzle: a **self-owned software playback engine** that plays a pre-extracted JPEG frame sequence on the wallpaper surface, so a video wallpaper runs on **every device** — including ones where the hardware/Media3 AVC decoder cannot create a session for the wallpaper surface at all. Extraction runs once per video off-thread (with a background `HandlerThread` doing MediaCodec decode-to-buffer → YUV→NV21→JPEG); replay is display-driven via `Choreographer` with a small lookahead `LinkedHashMap` LRU cache. Supports source frame rates **up to 120 fps**; extraction FPS is capped at `min(sourceFps, 120)` and stored in the manifest.
+
+### Native — FrameSequenceExtractor (`com.wall_e.bridge`)
+- Decode-to-buffer pipeline (`MediaCodec` → `Image` → YUV_420_888 → NV21 → `YuvImage.compressToJpeg` → scaled JPEG + matrix rotation) that never touches a GPU surface, with automatic software-decoder fallback (`c2.android` / `omx.google` / `arc.` names).
+- Writes JPEGs (`frame_%06d.jpg`) + `manifest.json {fps, frames, width, height, durationMs}` into a deterministic `seq_<sha1digest10>` directory under `filesDir/wallpapers/`.
+- Upscales / downscales long-edge to 1280; JPEG quality 68; a 120fps × 30s clip stays within the existing 1 GiB storage quota.
+
+### Native — SequencePlayer (`com.wall_e.bridge`)
+- In-memory `LinkedHashMap` LRU cache (9 entries, insertion-access-order, eviction recycles on the loader thread) + `HandlerThread` ahead-of-time decode (4-frame lookahead).
+- `frameAt(index)` returns null (never an incomplete bitmap) while that frame is still decoding; the caller shows the last good frame.
+- `prime(startIndex)` pre-warms the cache so the first painted frame is visible almost instantly.
+
+### WallpaperService.kt integration
+- New config keys read in `loadConfiguration()`: `W_SEQ_DIR`, `W_SEQ_FPS`, `W_SEQ_FRAMES`.
+- Config watchdog signature now includes the sequence dir/fps/frames so a freshly written sequence reloads the engine automatically.
+- `startFrameFallback()` now tries `startSequencePlayback()` first (opens the `SequencePlayer`, sets the fallback bitmap holder and wall-clock clock, returns); only if no sequence exists does it fall through to the existing `MediaMetadataRetriever` per-frame path.
+- `renderFrameFallback(canvas)` drives the sequence player's `frameAt(index)` via wall-clock elapsed time; one-shot clips reset on re-visibility and replay from the start.
+- `releaseFrameFallback()` releases the `SequencePlayer` and its background loader thread.
+- `doFrame()` / `checkPlayerWatchdog()` / `onVisibilityChanged()` gates extended so the sequence player is never interrupted once active.
+
+### WallpaperModule bridge + config
+- `@ReactMethod prepareVideoFrameSequence(videoUri, promise)`: runs `FrameSequenceExtractor.extract` on a background thread, caches the result in an in-memory `ConcurrentHashMap`, and — if the URI matches the live wallpaper's current `W_PATH` — writes `W_SEQ_DIR`/`W_SEQ_FPS`/`W_SEQ_FRAMES` directly to the committed + preview `SharedPreferences` so the running service picks them up on its next watchdog reload.
+- `saveWallpaperConfig` / `savePreviewConfig` now call `writeSequenceKeysIfCached` before committing.
+- `commitPendingToWallpaper()` carries the three `W_SEQ_*` keys across from preview → committed.
+- `getWallpaperStorage()` now also lists `seq_*` directories as single storage items (total recursive byte size, manifest mtime).
+- `deleteStoredMedia()` now handles directory targets via `deleteRecursively()`.
+
+### TypeScript
+- `wallpaperBridge.ts`: new `prepareVideoFrameSequence(videoUri)` wrapper (5-minute timeout for long 120fps clips).
+- `wallpaperRepository.ts`: new `allDigests()` method on `videoFiles` returns every registered SHA-1 digest.
+- `storageManager.ts`: `isAppPrivateEntry()` now accepts `seq_*`; `isUnreferenced()` accepts a `referencedSeqNames` set derived from `allDigests()` so sequence dirs belonging to registered videos are kept; everything else is prunable.
+- `App.tsx`: fire-and-forget `wallpaperBridge.prepareVideoFrameSequence(...)` after `resolvePickedVideo` (both create and replace flows) and on successful `performApply` for video wallpapers so the sequence is always available regardless of whether the device was healthy when the video was first imported.
+
+Verification: `:app:compileDebugKotlin` BUILD SUCCESSFUL; `tsc --noEmit` clean; Jest PASS (1/1); `rtk lint` unchanged (same pre-existing inline-style + rotation `exhaustive-deps` warnings).

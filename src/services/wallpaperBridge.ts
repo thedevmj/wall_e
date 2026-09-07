@@ -15,10 +15,22 @@ type NativeWallpaperResult = {
 type NativeVideoResult = {
   uri?: unknown;
   durationSeconds?: unknown;
+  bytes?: unknown;
+  digest?: unknown;
+  posterUri?: unknown;
 };
 
 type NativeImageResult = {
   uri?: unknown;
+};
+
+type NativeSequenceResult = {
+  dir?: unknown;
+  frames?: unknown;
+  fps?: unknown;
+  width?: unknown;
+  height?: unknown;
+  durationMs?: unknown;
 };
 
 type NativeWallpaperModule = {
@@ -30,6 +42,9 @@ type NativeWallpaperModule = {
   prepareBundledMedia?: (source: string, kind: string) => Promise<unknown>;
   getBatteryLevel?: () => Promise<unknown>;
   copyToClipboard?: (text: string) => void;
+  deleteStoredMedia?: (uri: string) => Promise<unknown>;
+  getWallpaperStorage?: () => Promise<unknown>;
+  prepareVideoFrameSequence?: (videoUri: string) => Promise<unknown>;
 };
 
 const fallbackCapabilities: WallpaperCapabilities = {
@@ -232,6 +247,12 @@ export const wallpaperBridge = {
           Number.isFinite(Number(video.durationSeconds)) && Number(video.durationSeconds) > 0
             ? Number(video.durationSeconds)
             : 30,
+        bytes:
+          Number.isFinite(Number(video.bytes)) && Number(video.bytes) > 0
+            ? Number(video.bytes)
+            : undefined,
+        digest: asString(video.digest),
+        posterUri: asString(video.posterUri),
       };
     } catch (error) {
       console.warn('Video picker failed', error);
@@ -349,6 +370,128 @@ export const wallpaperBridge = {
       }
     } catch (error) {
       console.warn('copyToClipboard failed', error);
+    }
+  },
+
+  /**
+   * Deletes an app-private media file (copied video/image) plus its cached
+   * rotated variants. Called when a user wallpaper is deleted or its video is
+   * replaced so copies do not accumulate in app storage. Returns the number of
+   * files deleted.
+   */
+  async deleteStoredMedia(uri: string | undefined): Promise<number> {
+    if (!uri) return 0;
+    try {
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.deleteStoredMedia !== 'function') {
+        return 0;
+      }
+      const result = await withTimeout(
+        nativeModule.deleteStoredMedia(uri),
+        NATIVE_CALL_TIMEOUT_MS,
+        'deleteStoredMedia',
+      );
+      return typeof result === 'number' ? result : 0;
+    } catch (error) {
+      console.warn('deleteStoredMedia failed', error);
+      return 0;
+    }
+  },
+
+  /**
+   * Reads app-private wallpaper storage usage (files copied under
+   * filesDir/wallpapers). Returns `null` when the native module is unavailable.
+   * The `items` list is sorted oldest-first and carries absolute paths, byte
+   * sizes, and last-modified times so the JS layer can prune orphans.
+   */
+  async getWallpaperStorage(): Promise<{
+    files: number;
+    totalBytes: number;
+    items: { path: string; name: string; bytes: number; modified: number }[];
+  } | null> {
+    try {
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.getWallpaperStorage !== 'function') {
+        return null;
+      }
+      const result = await withTimeout(
+        nativeModule.getWallpaperStorage(),
+        NATIVE_CALL_TIMEOUT_MS,
+        'getWallpaperStorage',
+      );
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const storage = result as {
+        files?: unknown;
+        totalBytes?: unknown;
+        items?: unknown;
+      };
+      const rawItems = Array.isArray(storage.items) ? storage.items : [];
+      const items = rawItems
+        .filter((item): item is Record<string, unknown> =>
+          typeof item === 'object' && item !== null && !Array.isArray(item),
+        )
+        .map(item => ({
+          path: asString(item.path) ?? '',
+          name: asString(item.name) ?? '',
+          bytes: Number.isFinite(Number(item.bytes)) ? Number(item.bytes) : 0,
+          modified: Number.isFinite(Number(item.modified)) ? Number(item.modified) : 0,
+        }));
+      return {
+        files: Number.isFinite(Number(storage.files)) ? Number(storage.files) : items.length,
+        totalBytes: Number.isFinite(Number(storage.totalBytes)) ? Number(storage.totalBytes) : 0,
+        items,
+      };
+    } catch (error) {
+      console.warn('getWallpaperStorage failed', error);
+      return null;
+    }
+  },
+
+  /**
+   * Extracts the software-playback frame sequence for a video (JPEG frames +
+   * manifest) if not already cached, and returns its metadata. The wallpaper
+   * service falls back to this sequence when the device cannot create a video
+   * decoder for the wallpaper surface, so high-fps wallpapers still run on
+   * every device. Extraction runs off-thread; a long clip at 120 fps may take a
+   * while, so this is fire-and-forget from the UI.
+   */
+  async prepareVideoFrameSequence(videoUri: string): Promise<{
+    dir: string;
+    frames: number;
+    fps: number;
+    width: number;
+    height: number;
+    durationMs: number;
+  } | null> {
+    try {
+      const nativeModule = getNativeModule();
+      if (!nativeModule || typeof nativeModule.prepareVideoFrameSequence !== 'function') {
+        return null;
+      }
+      const result = await withTimeout(
+        nativeModule.prepareVideoFrameSequence(videoUri),
+        300000, // long clips at 120 fps take minutes to extract
+        'prepareVideoFrameSequence',
+      );
+      if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+        return null;
+      }
+      const seq = result as NativeSequenceResult;
+      const dir = asString(seq.dir);
+      if (!dir) return null;
+      return {
+        dir,
+        frames: Number.isFinite(Number(seq.frames)) ? Number(seq.frames) : 0,
+        fps: Number.isFinite(Number(seq.fps)) ? Number(seq.fps) : 24,
+        width: Number.isFinite(Number(seq.width)) ? Number(seq.width) : 0,
+        height: Number.isFinite(Number(seq.height)) ? Number(seq.height) : 0,
+        durationMs: Number.isFinite(Number(seq.durationMs)) ? Number(seq.durationMs) : 0,
+      };
+    } catch (error) {
+      console.warn('prepareVideoFrameSequence failed', error);
+      return null;
     }
   },
 };

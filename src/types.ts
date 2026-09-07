@@ -24,6 +24,12 @@ export type Wallpaper = {
 export type PickedVideo = {
   uri: string;
   durationSeconds: number;
+  /** SHA-1 digest of the copied file, used to de-duplicate re-imports. */
+  digest?: string;
+  /** Copied file size in bytes. */
+  bytes?: number;
+  /** App-private poster JPEG URI extracted from the first frame. */
+  posterUri?: string;
 };
 
 export type PickedImage = {

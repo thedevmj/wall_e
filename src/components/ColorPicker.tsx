@@ -1,5 +1,7 @@
 import React from 'react';
 import { View, PanResponder, LayoutChangeEvent, StyleSheet, Text, Animated } from 'react-native';
+import { useTheme } from '../theme/ThemeContext';
+import type { ThemePalette } from '../theme/palette';
 
 type Props = {
   color: string;
@@ -128,6 +130,8 @@ const hueStyles = StyleSheet.create({
 const THUMB = 22;
 
 export function ColorPicker({ color, onChange }: Props) {
+  const { palette } = useTheme();
+  const styles = React.useMemo(() => createPickerStyles(palette), [palette]);
   const [hsv, setHsv] = React.useState<[number, number, number]>(() => hexToHsv(color));
   const [boxW, setBoxW] = React.useState(220);
   const [boxH, setBoxH] = React.useState(220);
@@ -364,79 +368,81 @@ export function ColorPicker({ color, onChange }: Props) {
 
 /* ── Styles ────────────────────────────────────────────────────────────── */
 
-const styles = StyleSheet.create({
-  container: { marginBottom: 14 },
-  label: {
-    color: '#E0FFFF',
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 10,
-  },
-  sbWrap: {
-    borderRadius: 10,
-    overflow: 'visible',
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.15)',
-  },
-  sbThumb: {
-    position: 'absolute',
-    width: THUMB + 4,
-    height: THUMB + 4,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sbThumbRing: {
-    width: THUMB,
-    height: THUMB,
-    borderRadius: THUMB / 2,
-    borderWidth: 2.5,
-    borderColor: '#FFFFFF',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.5,
-    shadowRadius: 3,
-    elevation: 4,
-  },
-  hueWrap: {
-    position: 'relative',
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.15)',
-    borderRadius: 10,
-    overflow: 'visible',
-  },
-  hueThumb: {
-    position: 'absolute',
-    top: -3,
-    width: THUMB + 4,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 2.5,
-    borderColor: '#FFFFFF',
-    backgroundColor: 'transparent',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.4,
-    shadowRadius: 2,
-    elevation: 3,
-  },
-  previewRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-  },
-  swatch: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    borderWidth: 2,
-    borderColor: 'rgba(255,255,255,0.25)',
-  },
-  hexText: {
-    color: '#E2E8F0',
-    fontSize: 14,
-    fontWeight: '700',
-    fontFamily: 'monospace',
-  },
-});
+function createPickerStyles(p: ThemePalette) {
+  return StyleSheet.create({
+    container: { marginBottom: 14 },
+    label: {
+      color: p.textBody,
+      fontSize: 13,
+      fontWeight: '700',
+      marginBottom: 10,
+    },
+    sbWrap: {
+      borderRadius: 10,
+      overflow: 'visible',
+      marginBottom: 10,
+      borderWidth: 1,
+      borderColor: p.surfaceBorder,
+    },
+    sbThumb: {
+      position: 'absolute',
+      width: THUMB + 4,
+      height: THUMB + 4,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    sbThumbRing: {
+      width: THUMB,
+      height: THUMB,
+      borderRadius: THUMB / 2,
+      borderWidth: 2.5,
+      borderColor: p.white,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.5,
+      shadowRadius: 3,
+      elevation: 4,
+    },
+    hueWrap: {
+      position: 'relative',
+      marginBottom: 12,
+      borderWidth: 1,
+      borderColor: p.surfaceBorder,
+      borderRadius: 10,
+      overflow: 'visible',
+    },
+    hueThumb: {
+      position: 'absolute',
+      top: -3,
+      width: THUMB + 4,
+      height: 24,
+      borderRadius: 12,
+      borderWidth: 2.5,
+      borderColor: p.white,
+      backgroundColor: 'transparent',
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.4,
+      shadowRadius: 2,
+      elevation: 3,
+    },
+    previewRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    swatch: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      borderWidth: 2,
+      borderColor: p.surfaceBorder,
+    },
+    hexText: {
+      color: p.textBody,
+      fontSize: 14,
+      fontWeight: '700',
+      fontFamily: 'monospace',
+    },
+  });
+}

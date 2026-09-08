@@ -326,13 +326,23 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             Thread {
                 try {
                     val original = resolveMediaUri(videoUri, "bundled_video", "mp4")
+                    // When a software frame sequence exists for the original file,
+                    // play the original with W_ROTATION set: the sequence engine
+                    // renders the rotated orientation natively (cheap matrix) and
+                    // never stutters. Transcoding to a pre-rotated file is only
+                    // worthwhile when there is no sequence to serve the rotation.
+                    if (readSequenceInfo(sequenceDirFor(absFile(original) ?: File(original.path.orEmpty()))) != null) {
+                        Log.i(TAG, "Sequence available for original; applying original with rotation=$normalizedRotation")
+                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, accent, promise, original.toString())
+                        return@Thread
+                    }
                     val rotatedUri = rotateVideoIfPossible(original, normalizedRotation)
                     if (rotatedUri != null) {
                         Log.i(TAG, "Rotation transcode succeeded; playing pre-rotated file with rotation=0")
                         finishLiveApply(id, kind, destination, rotatedUri.toString(), loop, playbackDuration, audio, 0, accent, promise)
                     } else {
                         Log.w(TAG, "Rotation transcode failed/unavailable; falling back to original with rotation=$normalizedRotation")
-                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, accent, promise)
+                        finishLiveApply(id, kind, destination, original.toString(), loop, playbackDuration, audio, normalizedRotation, accent, promise, original.toString())
                     }
                 } catch (error: Exception) {
                     Log.e(TAG, "Failed to apply wallpaper (rotation path)", error)
@@ -372,6 +382,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         rotation: Int,
         accent: String,
         promise: Promise,
+        sequenceUri: String? = null,
     ) {
         // Write only a *pending* config first; it becomes the committed wallpaper
         // when the user confirms in the system live wallpaper picker. The
@@ -382,7 +393,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         // system_server, which a normal install never holds, and it added a code
         // path that could leave wallpaper in a half-set state. The auto-targeted
         // system picker is the reliable path on every Android device.
-        savePreviewConfig(id, kind, mediaUri, loop, playbackDuration, audio, accent, rotation)
+        savePreviewConfig(id, kind, mediaUri, loop, playbackDuration, audio, accent, rotation, sequenceUri)
         val component = ComponentName(reactContext.packageName, "com.wall_e.wallpaper.LiveWallpaperService")
 
         val flags = when (destination.uppercase()) {
@@ -717,7 +728,7 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
      * in the system wallpaper picker; the committed store is updated only after
      * the user confirms (see [resolvePendingApply]).
      */
-    private fun savePreviewConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String, rotation: Int = 0) {
+    private fun savePreviewConfig(id: String, kind: String, videoUri: String, loop: Boolean, playbackDuration: Int, audio: Boolean, accent: String, rotation: Int = 0, sequenceUri: String? = null) {
         val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
         val finalAccent = if (accent.isNotBlank()) accent else "#7C3AED"
 
@@ -732,7 +743,11 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
             .putBoolean("W_AUDIO", audio)
             .putString("W_ACCENT", finalAccent)
             .putInt("W_ROTATION", rotation.coerceIn(0, 270))
-        writeSequenceKeysIfCached(editor, videoUri)
+        // A rotated wallpaper plays a pre-rotated copy (W_PATH), but its frame
+        // sequence was extracted from the ORIGINAL file. Look the sequence keys
+        // up against the original uri so the engine still engages the software
+        // path; otherwise it falls back to ExoPlayer and stutters.
+        writeSequenceKeysIfCached(editor, sequenceUri ?: videoUri)
         editor.commit()
 
         // Tag the committed store with the id of the pending live wallpaper so
@@ -1120,7 +1135,13 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
     private fun writeSequenceKeysIfCached(editor: android.content.SharedPreferences.Editor, videoUri: String) {
         val file = absoluteFileFromUri(videoUri) ?: return
-        val info = frameSequenceCache[file.absolutePath] ?: return
+        // Prefer the in-memory cache, but fall back to reading the on-disk
+        // manifest so W_SEQ_DIR etc. reach the wallpaper service even on the
+        // first apply of a session, before prepareVideoFrameSequence has run
+        // in-process. Without this the engine starts on ExoPlayer and stutters.
+        val info = frameSequenceCache[file.absolutePath]
+            ?: readSequenceInfo(sequenceDirFor(file))
+        if (info == null) return
         editor.putString("W_SEQ_DIR", info.dirPath)
         editor.putInt("W_SEQ_FPS", info.fps)
         editor.putInt("W_SEQ_FRAMES", info.frames)

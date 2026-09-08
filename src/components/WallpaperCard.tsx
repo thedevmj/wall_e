@@ -1,6 +1,6 @@
 import React from 'react';
 import { Animated, Pressable, Text, TouchableOpacity, View } from 'react-native';
-import { styles } from '../styles';
+import { useThemedStyles } from '../theme/ThemeContext';
 import type { Wallpaper } from '../types';
 
 type WallpaperCardProps = {
@@ -11,6 +11,7 @@ type WallpaperCardProps = {
 };
 
 export function WallpaperCard({ wallpaper, index, onPress, onDelete }: WallpaperCardProps) {
+  const styles = useThemedStyles();
   const pulse = React.useRef(new Animated.Value(1)).current;
 
   React.useEffect(() => {

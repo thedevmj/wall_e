@@ -1,6 +1,6 @@
 import React from 'react';
 import { Pressable, Text, ViewStyle } from 'react-native';
-import { styles } from '../styles';
+import { useThemedStyles } from '../theme/ThemeContext';
 
 type ActionButtonProps = {
   label: string;
@@ -17,6 +17,7 @@ export function ActionButton({
   style,
   disabled = false,
 }: ActionButtonProps) {
+  const styles = useThemedStyles();
   return (
     <Pressable
       accessibilityRole="button"

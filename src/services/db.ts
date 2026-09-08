@@ -87,6 +87,23 @@ export async function getMeta(key: string): Promise<string | null> {
 }
 
 /**
+ * Synchronous meta helpers used for theme mode so the UI renders with the
+ * correct palette before the first async frame. op-sqlite reads/writes are
+ * synchronous, so these are safe to call during React render/effects.
+ */
+export function getMetaSync(key: string): string | null {
+  const db = getDB();
+  const result = db.executeSync('SELECT value FROM meta WHERE key = ?', [key]);
+  if (result.rows.length === 0) return null;
+  return String(result.rows[0].value);
+}
+
+export function setMetaSync(key: string, value: string): void {
+  const db = getDB();
+  db.executeSync('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', [key, value]);
+}
+
+/**
  * Executes a write within a transaction via executeBatch-style helper. Most
  * caller writes are single-row upserts/deletes, so a single execute is used
  * directly with op-sqlite's async API.

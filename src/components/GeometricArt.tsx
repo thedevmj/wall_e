@@ -1,6 +1,6 @@
 import React from 'react';
 import { View } from 'react-native';
-import { styles } from '../styles';
+import { useThemedStyles } from '../theme/ThemeContext';
 
 /**
  * Color helpers for the abstract art: convert a hex accent into a small
@@ -47,6 +47,7 @@ type GeometricArtProps = {
  * each wallpaper looks different from the others.
  */
 export function GeometricArt({ accent, size, seed = 0 }: GeometricArtProps) {
+  const styles = useThemedStyles();
   const light = mix(accent, true, 0.55);
   const paper = mix(accent, true, 0.78);
   const deep = mix(accent, false, 0.4);

@@ -20,6 +20,8 @@ import { getDB, toBool, toInt, toStr, rowsAs } from './db';
 
 const USER_CREATED_KINDS = new Set<WallpaperKind>(['video', 'static']);
 
+const BUNDLED_IDS = new Set(bundledWallpapers.map(w => w.id));
+
 const PAGE_SIZE_DEFAULT = 50;
 
 function fromRow(row: Record<string, unknown>): Wallpaper {
@@ -72,8 +74,46 @@ function toArgs(wallpaper: Wallpaper): (string | number | null)[] {
   ];
 }
 
+/**
+ * A wallpaper is user-created only when it is a video/static kind AND it does
+ * not collide with a bundled (code-defined) wallpaper ID. Bundled wallpapers
+ * also use video/static kinds and all carry `createdAt: 'Bundled'`, so the ID
+ * check is what stops them from being persisted — previously merely opening a
+ * bundled wallpaper triggered an upsert and silently added hidden DB rows.
+ */
 function isUserCreated(wallpaper: Wallpaper): boolean {
+  if (BUNDLED_IDS.has(wallpaper.id)) return false;
   return USER_CREATED_KINDS.has(wallpaper.kind);
+}
+
+/**
+ * Whether a wallpaper is a bundled (code-defined, read-only) default. Used by
+ * the UI to hide Delete for bundled wallpapers.
+ */
+export function isBundled(wallpaper: Wallpaper): boolean {
+  return (
+    wallpaper.createdAt === 'Bundled' ||
+    wallpaper.source != null ||
+    BUNDLED_IDS.has(wallpaper.id)
+  );
+}
+
+/**
+ * Whether a user-created wallpaper would render as a duplicate of a bundled
+ * default in the library list. The bundled catalog is always merged into
+ * `getAll()` by *id*, so a user row with the same title (and kind) as a bundled
+ * default would appear as a second, visually identical card. Returns the
+ * matching bundled wallpaper (which the caller can open instead) or null.
+ */
+export function findBundledTitleCollision(
+  title: string,
+  kind: WallpaperKind,
+): Wallpaper | undefined {
+  const normalized = title.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return bundledWallpapers.find(
+    w => w.kind === kind && w.title.trim().toLowerCase() === normalized,
+  );
 }
 
 /**
@@ -172,8 +212,7 @@ export const wallpaperRepository = {
    * be deleted (returns false).
    */
   async delete(id: string): Promise<boolean> {
-    const bundledIds = new Set(bundledWallpapers.map(w => w.id));
-    if (bundledIds.has(id)) return false;
+    if (BUNDLED_IDS.has(id)) return false;
     try {
       const db = getDB();
       const result = await db.execute('DELETE FROM wallpapers WHERE id = ?', [id]);
@@ -189,6 +228,71 @@ export const wallpaperRepository = {
    */
   isPersisted(wallpaper: Wallpaper): boolean {
     return isUserCreated(wallpaper);
+  },
+
+  /**
+   * Older builds could persist bundled wallpapers into SQLite because they only
+   * checked `kind`. Prunes any leftover bundled rows so the library does not
+   * show duplicate/stale defaults. Safe to run on every launch.
+   */
+  async pruneBundledRows(): Promise<number> {
+    if (BUNDLED_IDS.size === 0) return 0;
+    try {
+      const db = getDB();
+      const placeholders = Array.from(BUNDLED_IDS).map(() => '?').join(', ');
+      const result = await db.execute(
+        `DELETE FROM wallpapers WHERE id IN (${placeholders})`,
+        Array.from(BUNDLED_IDS),
+      );
+      return result.rowsAffected;
+    } catch (error) {
+      console.warn('WallpaperRepository.pruneBundledRows failed', error);
+      return 0;
+    }
+  },
+
+  /**
+   * Older builds (and fast double-taps) could persist two user wallpapers that
+   * use the SAME media file with the SAME name — the library then lists the
+   * same card twice. De-duplicates rows by (kind, title, media uri), keeping
+   * only the newest copy. Only DB rows are removed (never the shared media
+   * file); returns the number of rows deleted.
+   */
+  async dedupeUserWallpapers(): Promise<number> {
+    try {
+      const db = getDB();
+      const result = await db.execute('SELECT * FROM wallpapers ORDER BY created_at DESC');
+      const seen = new Map<string, string>();
+      const stale: string[] = [];
+      for (const row of result.rows) {
+        const kind = toStr(row.kind);
+        if (!USER_CREATED_KINDS.has(kind as WallpaperKind)) continue;
+        const media = kind === 'video' ? toStr(row.video_uri) : toStr(row.image_uri);
+        if (!media) continue;
+        // A user row that duplicates a bundled default's title+kind would render
+        // as a second identical card (the bundled catalog is always merged in),
+        // so drop it — the bundled default already represents it.
+        if (findBundledTitleCollision(toStr(row.title), kind as WallpaperKind)) {
+          stale.push(toStr(row.id));
+          continue;
+        }
+        const key = `${kind}|${toStr(row.title)}|${media}`;
+        if (seen.has(key)) {
+          stale.push(toStr(row.id));
+        } else {
+          seen.set(key, toStr(row.id));
+        }
+      }
+      let deleted = 0;
+      for (const id of stale) {
+        const r = await db.execute('DELETE FROM wallpapers WHERE id = ?', [id]);
+        deleted += r.rowsAffected;
+      }
+      return deleted;
+    } catch (error) {
+      console.warn('WallpaperRepository.dedupeUserWallpapers failed', error);
+      return 0;
+    }
   },
 
   async count(): Promise<number> {

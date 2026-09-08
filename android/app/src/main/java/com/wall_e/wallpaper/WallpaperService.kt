@@ -545,6 +545,16 @@ class LiveWallpaperService : WallpaperService() {
                 return
             }
 
+            // SOFTWARE-SEQUENCE FIRST: when the app already prepared a frame
+            // sequence for this exact video (W_SEQ_DIR), play it directly. On
+            // devices whose hardware/Media3 AVC decoder cannot keep a wallpaper
+            // surface session smooth (it may initialize then drop frames and
+            // stutter while still reporting STATE_READY), ExoPlayer never
+            // receives a hard error so the legacy fallback never engages. The
+            // pre-decoded JPEG sequence is the only path proven to stay smooth;
+            // ExoPlayer/GL remain as fallback when no sequence is available.
+            if (startSequencePlayback()) return
+
             // One-shot ("play once") clips always render through the GPU texture
             // pipeline so the GL pass can blend the fade-to-black / fade-back-in
             // overlay smoothly on top of the live frames. Loop clips also use GL
@@ -891,6 +901,14 @@ class LiveWallpaperService : WallpaperService() {
 
         private fun startSequencePlayback(): Boolean {
             if (sequenceDirPath.isBlank()) return false
+            // Tear down any stale ExoPlayer/GL pipeline from a previous video so
+            // the engine cannot keep rendering with a released/hung player while
+            // the sequence starts.
+            synchronized(playerLock) {
+                releaseExoPlayerLocked()
+                videoFailed = false
+                videoErrorMessage = ""
+            }
             val player = try {
                 SequencePlayer(sequenceDirPath)
             } catch (error: Exception) {
@@ -956,12 +974,13 @@ class LiveWallpaperService : WallpaperService() {
                 val elapsedMs = System.currentTimeMillis() - frameFallbackStartedAt
                 val frameIndex = (elapsedMs * fps / 1000).toInt()
                 val frame = seqPlayer.frameAt(frameIndex)
-                if (frame != null) {
+                val bitmap = frame ?: seqPlayer.latestReadyAtOrBefore(frameIndex)
+                if (bitmap != null) {
                     // Do NOT recycle the previous frame here: it may still live in
                     // the SequencePlayer's LRU cache. The player reclaims evicted
                     // frames itself on its loader thread.
-                    synchronized(frameLock) { frameFallbackBitmap = frame }
-                    drawRotatedBitmap(canvas, frame)
+                    synchronized(frameLock) { frameFallbackBitmap = bitmap }
+                    drawRotatedBitmap(canvas, bitmap)
                     if (!shouldLoop && frameIndex >= seqPlayer.frameCount()) {
                         frameFallbackFinished = true
                         return true
@@ -970,8 +989,8 @@ class LiveWallpaperService : WallpaperService() {
                 }
                 // First frames still decoding; show whatever decoded so far.
                 synchronized(frameLock) {
-                    val bitmap = frameFallbackBitmap ?: return false
-                    drawRotatedBitmap(canvas, bitmap)
+                    val current = frameFallbackBitmap ?: return false
+                    drawRotatedBitmap(canvas, current)
                     return true
                 }
             }
@@ -1020,7 +1039,7 @@ class LiveWallpaperService : WallpaperService() {
                 canvas.rotate(videoRotationDegrees.toFloat(), rotateCenterWidth, rotateCenterHeight)
             }
 
-            canvas.drawColor(Color.BLACK)
+            // Cover fill paints the whole screen, so no background fill is needed.
             val source = android.graphics.Rect(0, 0, bitmap.width, bitmap.height)
 
             // The rotated footprint of the content on screen.

@@ -406,7 +406,7 @@ Builds the last major piece of the playback-availability puzzle: a **self-owned 
 - Upscales / downscales long-edge to 1280; JPEG quality 68; a 120fps × 30s clip stays within the existing 1 GiB storage quota.
 
 ### Native — SequencePlayer (`com.wall_e.bridge`)
-- In-memory `LinkedHashMap` LRU cache (9 entries, insertion-access-order, eviction recycles on the loader thread) + `HandlerThread` ahead-of-time decode (4-frame lookahead).
+- In-memory `LinkedHashMap` LRU cache (**12** entries, insertion-access-order, eviction recycles on the loader thread) + `HandlerThread` ahead-of-time decode (**6-frame** lookahead). A `pendingDecodes` set deduplicates in-flight decode requests so the same frame is never submitted twice concurrently. `release()` clears the set and the cache.
 - `frameAt(index)` returns null (never an incomplete bitmap) while that frame is still decoding; the caller shows the last good frame.
 - `prime(startIndex)` pre-warms the cache so the first painted frame is visible almost instantly.
 
@@ -432,3 +432,60 @@ Builds the last major piece of the playback-availability puzzle: a **self-owned 
 - `App.tsx`: fire-and-forget `wallpaperBridge.prepareVideoFrameSequence(...)` after `resolvePickedVideo` (both create and replace flows) and on successful `performApply` for video wallpapers so the sequence is always available regardless of whether the device was healthy when the video was first imported.
 
 Verification: `:app:compileDebugKotlin` BUILD SUCCESSFUL; `tsc --noEmit` clean; Jest PASS (1/1); `rtk lint` unchanged (same pre-existing inline-style + rotation `exhaustive-deps` warnings).
+
+## Recent Changes — Cherry-blossom theme, bundled-library guard, low-RAM playback tuning (this round)
+
+### 1. Light/dark theme system (cherry-blossom white default)
+- `src/theme/palette.ts`: new `ThemePalette` type plus `lightPalette` (default) and `darkPalette`. Light = cherry-blossom white (`#FFF7F9` background, `#EC4899` accent, plum text); dark = the original midnight-navy (`#050E23`, `#F472B6` accent). Every color token in the shared design system is derived from one palette.
+- `src/theme/ThemeContext.tsx`: `ThemeProvider` + `useTheme()` + `useThemedStyles()`. Mode is persisted under the `meta` table (`theme` = `light`/`dark`) and read synchronously (`getMetaSync`) so the first frame renders with the right palette; `toggleTheme()` writes it back.
+- `src/services/db.ts`: added `getMetaSync(key)` / `setMetaSync(key, value)` using `executeSync` (op-sqlite reads/writes are synchronous, safe during render).
+- `src/styles/index.ts`: no longer a static export. Now `createStyles(palette)` builds the full sheet per theme (identical style keys, plus new `themeToggle`/`themeToggleText`); removed the cyan `ACCENT` constant in favor of `palette.accent`.
+- Converted consumers to `useThemedStyles()`: `App.tsx`, `src/components/ActionButton.tsx`, `src/components/GeometricArt.tsx`, `src/components/WallpaperCard.tsx`, and `src/components/ColorPicker.tsx` (picks up themed borders/labels instead of hardcoded dark colors).
+- `App.tsx`: header gains a theme-toggle pill (shows **Dark** in light mode, **Light** in dark mode); `StatusBar` `barStyle` flips (`dark-content` light / `light-content` dark); search/input placeholders, the applying `ActivityIndicator`, and the FAB now use the theme accent. Default export wraps the shell in `ThemeProvider`. Pre-existing lint gripes fixed (rotation `exhaustive-deps`).
+
+### 2. Bundled wallpapers are read-only — no delete, no hidden DB rows (cards only on video import)
+- Root cause: `isUserCreated()` only checked `kind` (`video`/`static`), so bundled wallpapers (same kinds, `createdAt: 'Bundled'`) were treated as user-created. Viewing/applying a bundled wallpaper ran `upsert` and silently wrote a DB row.
+- `wallpaperRepository.ts`: module `BUNDLED_IDS` set; `isUserCreated()` now also rejects bundled IDs; `upsert` is a no-op for bundled IDs; `isPersisted()` returns false for bundled (delete button hidden — DetailModal `canDelete` additionally requires `createdAt !== 'Bundled'`); exported `isBundled()` helper; new `pruneBundledRows()` deletes any legacy bundled rows on launch.
+- Result: new cards can only appear via the explicit create/import flow (`handleWallpaperCreated`); merely opening or applying existing wallpapers never adds library entries.
+
+### 3. Video playback stability on low-RAM (4GB) phones
+- `src/services/sequenceQueue.ts`: `enqueueVideoSequence(uri)` serializes the off-thread `prepareVideoFrameSequence` extractions (strict FIFO — one at a time) and de-duplicates concurrent requests by URI. Prevents several simultaneous decode/compress jobs (create + apply + replace) from OOM-ing a 4GB device. All 3 call sites in `App.tsx` now route through it.
+- Billboard (`Billboard`/`AppShell`): a new `isForeground` state (`AppState`) stops the 5s rotation and disables `autoPlay` video decoding while the app is backgrounded.
+- Detail preview + `LiveThumb` videos: `playInBackground={false}` and a memory-capped `bufferConfig` (`maxBufferMs` 60000, `maxHeapAllocationPercent` 25, `minBufferMemoryReservePercent` 10).
+
+### 4. Native extraction tuning (`FrameSequenceExtractor.kt`)
+- `MAX_FPS` 120 → **30** and `MAX_OUTPUT_DIMENSION` 1280 → **960**: extraction is drastically faster and the on-disk JPEG set is much smaller, which cuts both import-time memory pressure and long-run playback churn on low-RAM devices. Source rates above 30 fps are still extracted (capped), and `estimateFps` clamps to the new cap automatically. (Note: this supersedes the earlier "up to 120 fps" language and the older `playInBackground={true}` preview note.)
+
+Verification: `tsc --noEmit` clean; `rtk lint` clean of errors (9 pre-existing inline-style warnings only); Jest PASS (1/1) — header now asserts the **Dark** toggle renders in default light mode; `:app:compileDebugKotlin` BUILD SUCCESSFUL (only react-native-video deprecation/unchecked notes from the dependency, unchanged).
+
+---
+
+## Recent Changes — Sequence-first engine, duplicate guard, smooth in-app preview, header-only branding (this round)
+
+### 1. Sequence-first wallpaper engine (native)
+- Root cause of the stutter: on some devices (e.g. Redmi Note 10), the hardware AVC decoder can initialize into `STATE_READY` but silently drops frames once the surface is live. The old fallback never engaged because no hard error surfaced.
+- `WallpaperService.startExoPlayer()`: the very first thing after URI validation is `if (startSequencePlayback()) return` — if a pre-extracted JPEG sequence exists, ExoPlayer/GL is never touched.
+- `startSequencePlayback()`: now tears down any stale ExoPlayer under `playerLock` (`releaseExoPlayerLocked()`) and resets `videoFailed`/`videoErrorMessage` before opening the `SequencePlayer`, so a previously failed video decoder cannot leave stale state.
+- `drawRotatedBitmap()`: removed the now-unnecessary `canvas.drawColor(Color.BLACK)` line — the cover-fill draw already covers the entire canvas.
+- Result: videos with a pre-extracted sequence play at the recorded FPS via Choreographer on every device, with zero reliance on the AVC decoder.
+
+### 2. SequencePlayer hardening (native)
+- `MAX_CACHED_FRAMES` 9 → **12**, `LOOKAHEAD_FRAMES` 4 → **6**: more pre-decoded frames buffered ahead, so the wallpaper surface rarely sees a null frame even when the loader thread is briefly slow.
+- Added a `pendingDecodes: HashSet<Int>`: any decode request for an index already in flight is deduplicated immediately, preventing redundant `MediaCodec` queue slots from being consumed when the Choreographer-driven loader and `prime()` overlap.
+
+### 3. Duplicate library rows — eradicated
+- Root cause: re-importing the same video returns the same URI (SHA-1 digest reuse) so two library rows could end up with the same `title` + `videoUri`; a fast double-tap on Create could also create two rows in the same tick.
+- `wallpaperRepository.ts`: new `dedupeUserWallpapers()`: groups user-created wallpapers by `(kind|title|mediaUri)`, keeps the newest row per group (`ORDER BY created_at DESC`), and deletes only DB rows — never media files.
+- `App.tsx`: mount effect runs `Promise.all([pruneBundledRows(), dedupeUserWallpapers()])` then re-`getAll()` and re-sets the list if the count changed, so any legacy duplicates are cleaned on first launch after update.
+- New `ownedMediaUrisRef` (Map<uri, id>) rebuilt from the full wallpaper list. `handleWallpaperCreated` checks the ref synchronously before the next tick (catches double-taps) and blocks creation with a toast (`"..." is already in your library`), opening the existing card instead. `handleWallpaperUpdated`/`handleWallpaperDeleted` keep the ref in sync.
+
+### 4. Smooth in-app sequence preview (React Native)
+- `sequenceQueue.ts`: `enqueueVideoSequence()` now resolves with the full sequence summary (`{ dir, frames, fps } | null`) instead of the bare video URI, so callers can drive a frame-by-frame preview directly from the extracted JPEGs.
+- New `SequenceVideo` component (defined in `App.tsx`): renders one `<Image>` at a time, advancing a frame index via `setInterval` at the recorded FPS while `Image.prefetch` warms the next frame ahead. Pauses automatically when the app is backgrounded (`AppState`). Loops by default; non-loop holds the last frame.
+- `WallpaperDetailModal`: for user-imported videos (not bundled), the effect now calls `enqueueVideoSequence(videoUri)` on open and stores the result in `sequenceInfo`. When `sequenceInfo` is present, the preview renders `<SequenceVideo>` (with the existing rotation transform) instead of `<Video>`, so the in-app preview matches the wallpaper engine exactly — zero reliance on the device's video decoder.
+
+### 5. Header-only branding
+- `App.tsx` header: removed the cherry-blossom SVG icon, subtitle, and theme-toggle pill. The brand row now renders only `<Text testID="app-title">LiveWallpaper Studio</Text>`, centered.
+- `src/styles/index.ts`: removed the now-unused `brandIcon`, `brandText`, `subtitle`, `themeToggle`, `themeToggleText` style rules; `brandRow` now sets `justifyContent: 'center'` to keep the title centered. The `useTheme()` destructure in `AppShell` drops the now-unused `toggleTheme` (theme is still toggled programmatically; `isDarkTheme` is still used for `StatusBar` `barStyle`).
+
+Verification: `tsc --noEmit` clean (0 errors); `rtk lint` clean of errors (8 pre-existing inline-style warnings only); Jest PASS (1/1); `:app:compileDebugKotlin` BUILD SUCCESSFUL.

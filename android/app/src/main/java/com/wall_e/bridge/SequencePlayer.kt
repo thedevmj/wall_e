@@ -13,8 +13,8 @@ import java.util.LinkedHashMap
  * Self-owned software playback of a pre-extracted JPEG frame sequence. The
  * wallpaper engine drives the timeline (display vsync), and this player just
  * answers "which frame looks right for this timestamp". Frames are decoded on
- * a dedicated background thread with a small moving lookahead so playback at up
- * to 120 fps never hiccups on decode latency.
+ * a dedicated background thread with a small moving lookahead so playback
+ * (sequences are extracted at up to 30 fps) never hiccups on decode latency.
  *
  * Because it only touches JPEG files and keeps a small decoded cache, it works
  * on any device — including ones where the hardware/Media3 decoder cannot
@@ -25,8 +25,8 @@ class SequencePlayer(
 ) {
     companion object {
         private const val TAG = "SequencePlayer"
-        private const val MAX_CACHED_FRAMES = 9
-        private const val LOOKAHEAD_FRAMES = 4
+        private const val MAX_CACHED_FRAMES = 20
+        private const val LOOKAHEAD_FRAMES = 10
     }
 
     private val baseDir = File(dirPath)
@@ -43,6 +43,10 @@ class SequencePlayer(
             return false
         }
     }
+
+    /** Indices currently queued on the loader thread, so redundant decode
+     *  requests for the same frame collapse instead of piling up work. */
+    private val pendingDecodes = HashSet<Int>()
 
     private val loadThread = HandlerThread("seq-loader").apply { start() }
     private val loadHandler = Handler(loadThread.looper)
@@ -104,11 +108,17 @@ class SequencePlayer(
 
     private fun requestDecode(index: Int) {
         synchronized(lock) {
-            if (cache.containsKey(index)) return
+            if (cache.containsKey(index) || pendingDecodes.contains(index)) return
+            pendingDecodes.add(index)
         }
         loadHandler.post {
-            val bitmap = decodeFrame(index) ?: return@post
+            val bitmap = decodeFrame(index)
+            if (bitmap == null) {
+                synchronized(lock) { pendingDecodes.remove(index) }
+                return@post
+            }
             val alreadyDecoded = synchronized(lock) {
+                pendingDecodes.remove(index)
                 if (cache.containsKey(index)) {
                     true
                 } else {
@@ -118,6 +128,31 @@ class SequencePlayer(
             }
             if (alreadyDecoded) bitmap.recycle()
         }
+    }
+
+    /**
+     * Returns the newest decoded frame whose index is at or behind [index]
+     * (and within the lookahead window so wrapping can never surface a very
+     * stale frame). The renderer uses this when the exact frame is not ready
+     * yet — instead of holding an arbitrarily old frame and waiting, it shows
+     * the latest available, then naturally skips the backlog once decode
+     * catches up. Mirrors how real players drop frames under load.
+     */
+    fun latestReadyAtOrBefore(index: Int): Bitmap? {
+        if (!ready || frames == 0) return null
+        val target = index.mod(frames)
+        var bestDistance = -1
+        var best: Bitmap? = null
+        synchronized(lock) {
+            for (key in cache.keys) {
+                val distance = ((target - key) % frames + frames) % frames
+                if (distance <= LOOKAHEAD_FRAMES && distance > bestDistance) {
+                    bestDistance = distance
+                    best = cache[key]
+                }
+            }
+        }
+        return best
     }
 
     private fun decodeFrame(index: Int): Bitmap? {
@@ -143,6 +178,7 @@ class SequencePlayer(
     /** Flushes decode-ahead and recycles everything (called from a non-render thread). */
     fun release() {
         synchronized(lock) {
+            pendingDecodes.clear()
             cache.values.forEach { it.recycle() }
             cache.clear()
         }

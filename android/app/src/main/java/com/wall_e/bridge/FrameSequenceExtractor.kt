@@ -29,14 +29,15 @@ import java.io.File
  *
  * Supported sources: any stream MediaCodec can decode (H.264 / Baseline+High,
  * H.265, VP8/VP9 on capable devices). Frames are emitted at the source rate,
- * capped at MAX_FPS (120), so 24/30/60/90/120 fps videos all stay buttery.
- * Output JPEGs are scaled down to max SQ_HEIGHT so a long clip still fits the
- * storage quota.
+ * capped at MAX_FPS (30) so 24/30 fps videos play back smoothly while the
+ * extractor stays fast and the JPEG set stays small enough for low-RAM (<4GB)
+ * devices during both extraction and long-run playback. Output JPEGs are scaled
+ * down to max SQ_HEIGHT so a long clip still fits the storage quota.
  */
 object FrameSequenceExtractor {
     private const val TAG = "FrameSequenceExtractor"
-    private const val MAX_FPS = 120
-    private const val MAX_OUTPUT_DIMENSION = 1280
+    private const val MAX_FPS = 30
+    private const val MAX_OUTPUT_DIMENSION = 960
     private const val JPEG_QUALITY = 68
     private const val TIMEOUT_USEC = 10_000L
     private const val MAX_SECONDS_EXTRACTED = 300L

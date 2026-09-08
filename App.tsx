@@ -32,12 +32,16 @@ import { FluidFlowPreview } from './src/components/FluidFlowPreview';
 import { MembraneFlowPreview } from './src/components/MembraneFlowPreview';
 import { GeometricArt } from './src/components/GeometricArt';
 import { bundledWallpapers } from './src/data/bundledWallpapers';
-import { wallpaperRepository } from './src/services/wallpaperRepository';
+import { wallpaperRepository, findBundledTitleCollision } from './src/services/wallpaperRepository';
 import { wallpaperBridge } from './src/services/wallpaperBridge';
 import { enforceStorageQuota } from './src/services/storageManager';
 import { copyLogs, startLogCapture, logEvent } from './src/services/logService';
+import {
+  enqueueVideoSequence,
+  SequenceInfo,
+} from './src/services/sequenceQueue';
 import { showToast } from './src/services/toast';
-import { styles } from './src/styles';
+import { ThemeProvider, useTheme, useThemedStyles } from './src/theme/ThemeContext';
 import type { Wallpaper, WallpaperCapabilities } from './src/types';
 
 // ─── Error Boundary ──────────────────────────────────────────────────────
@@ -62,32 +66,46 @@ class ErrorBoundary extends React.Component<
   render() {
     if (this.state.hasError) {
       return (
-        <SafeAreaView style={styles.safeArea}>
-          <View style={styles.errorBoundary}>
-            <Text style={styles.errorBoundaryTitle}>Something went wrong</Text>
-            <Text style={styles.errorBoundaryMessage}>
-              {this.state.error?.message ?? 'An unexpected error occurred.'}
-            </Text>
-            <ActionButton
-              label="Copy Logs"
-              tone="secondary"
-              onPress={() => {
-                copyLogs();
-                Alert.alert('Logs Copied', 'Logs have been copied to your clipboard. You can paste and share them.');
-              }}
-            />
-            <View style={styles.errorBoundaryActions}>
-              <ActionButton
-                label="Restart"
-                onPress={() => this.setState({ hasError: false, error: null })}
-              />
-            </View>
-          </View>
-        </SafeAreaView>
+        <ErrorBoundaryView
+          message={this.state.error?.message ?? 'An unexpected error occurred.'}
+          onRestart={() => this.setState({ hasError: false, error: null })}
+        />
       );
     }
     return this.props.children;
   }
+}
+
+function ErrorBoundaryView({
+  message,
+  onRestart,
+}: {
+  message: string;
+  onRestart: () => void;
+}) {
+  const styles = useThemedStyles();
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <View style={styles.errorBoundary}>
+        <Text style={styles.errorBoundaryTitle}>Something went wrong</Text>
+        <Text style={styles.errorBoundaryMessage}>{message}</Text>
+        <ActionButton
+          label="Copy Logs"
+          tone="secondary"
+          onPress={() => {
+            copyLogs();
+            Alert.alert('Logs Copied', 'Logs have been copied to your clipboard. You can paste and share them.');
+          }}
+        />
+        <View style={styles.errorBoundaryActions}>
+          <ActionButton
+            label="Restart"
+            onPress={onRestart}
+          />
+        </View>
+      </View>
+    </SafeAreaView>
+  );
 }
 
 // ─── Create Wallpaper Modal ──────────────────────────────────────────────
@@ -99,6 +117,8 @@ type CreateModalProps = {
 };
 
 function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps) {
+  const styles = useThemedStyles();
+  const { palette } = useTheme();
   const [editorKind, setEditorKind] = React.useState<'video' | 'static'>('video');
   const [title, setTitle] = React.useState('');
   const [videoUri, setVideoUri] = React.useState<string | null>(null);
@@ -163,8 +183,9 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
         // Pre-extract the software-playback frame sequence in the background so
         // the wallpaper still plays smoothly on devices with no working video
         // decoder for the wallpaper surface (fire-and-forget; takes a while for
-        // long clips).
-        wallpaperBridge.prepareVideoFrameSequence(resolved.uri).catch(() => undefined);
+        // long clips). Extractions are serialized so low-RAM phones never run
+        // many encodes at once.
+        enqueueVideoSequence(resolved.uri).catch(() => undefined);
         setVideoUri(resolved.uri);
         setPickedVideoPoster(resolved.posterUri ?? null);
         setPlaybackDuration(Math.min(30, Math.max(1, Math.round(pickedVideo.durationSeconds))));
@@ -240,7 +261,7 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
           <TextInput
             accessibilityLabel="Wallpaper name"
             placeholder="Wallpaper name"
-            placeholderTextColor="#64748B"
+            placeholderTextColor={palette.placeholder}
             value={title}
             onChangeText={setTitle}
             style={styles.input}
@@ -408,6 +429,8 @@ const WallpaperDetailModal = React.memo(function ({
   onDelete,
   livePickerAvailable = true,
 }: DetailModalProps) {
+  const styles = useThemedStyles();
+  const { palette } = useTheme();
   const [isApplying, setIsApplying] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const [videoError, setVideoError] = React.useState(false);
@@ -417,11 +440,39 @@ const WallpaperDetailModal = React.memo(function ({
   const [preparedUri, setPreparedUri] = React.useState<string | null>(null);
   const [batteryInfo, setBatteryInfo] = React.useState<{ level: number; charging: boolean } | null>(null);
   const [showColorPicker, setShowColorPicker] = React.useState(true);
+  const [sequenceInfo, setSequenceInfo] = React.useState<SequenceInfo | null>(null);
 
   const isBundledVideo = wallpaper?.kind === 'video' && wallpaper?.source != null;
   const videoUri = wallpaper?.videoUri ?? '';
   const isRemotePreview = isBundledVideo && videoUri.startsWith('http');
-  const canDelete = wallpaper != null && wallpaperRepository.isPersisted(wallpaper);
+
+  // For user-imported videos, load (or lazily prepare on disk) the software
+  // frame sequence so the in-app preview matches the wallpaper engine instead
+  // of relying on the video decoder. Native short-circuits when the sequence
+  // already exists, so this is cheap on every subsequent open.
+  const wallpaperId = wallpaper?.id;
+  const wallpaperKind = wallpaper?.kind;
+  React.useEffect(() => {
+    setSequenceInfo(null);
+    if (!wallpaperId || wallpaperKind !== 'video' || isBundledVideo || !videoUri) {
+      return undefined;
+    }
+    let cancelled = false;
+    enqueueVideoSequence(videoUri)
+      .then(info => {
+        if (!cancelled && info) setSequenceInfo(info);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [wallpaperId, wallpaperKind, isBundledVideo, videoUri]);
+  // Only user-created (persisted) wallpapers can ever be deleted; bundled
+  // defaults never show the Delete action.
+  const canDelete =
+    wallpaper != null &&
+    wallpaper.createdAt !== 'Bundled' &&
+    wallpaperRepository.isPersisted(wallpaper);
 
   const previewRotationStyle = React.useMemo(() => {
     const deg = rotation % 360;
@@ -448,7 +499,7 @@ const WallpaperDetailModal = React.memo(function ({
     setRotation(
       wallpaper?.rotation === 90 || wallpaper?.rotation === 270 ? 90 : 0,
     );
-  }, [wallpaper?.id]);
+  }, [wallpaper?.id, wallpaper?.rotation]);
 
   // Read the real battery level/charging state for the battery fluid preview.
   React.useEffect(() => {
@@ -532,9 +583,10 @@ const WallpaperDetailModal = React.memo(function ({
         if (result.ok) {
           // Prepare the software-playback fallback sequence in the background so
           // this wallpaper runs on every device, even without a usable video
-          // decoder (extraction is one-time and cached on disk).
+          // decoder (extraction is one-time, cached on disk, and serialized so
+          // only one encode runs at a time on low-RAM phones).
           if (wallpaper.kind === 'video' && mediaUri) {
-            wallpaperBridge.prepareVideoFrameSequence(mediaUri).catch(() => undefined);
+            enqueueVideoSequence(mediaUri).catch(() => undefined);
           }
           const directSet =
             result.mode != null && result.mode.startsWith('direct-live-wallpaper');
@@ -622,7 +674,7 @@ const WallpaperDetailModal = React.memo(function ({
       // Reuse an existing app-private copy + thumbnail when this exact video
       // was imported before, so re-picking never multiplies storage usage.
       const resolved = await wallpaperRepository.videoFiles.resolvePickedVideo(pickedVideo);
-      wallpaperBridge.prepareVideoFrameSequence(resolved.uri).catch(() => undefined);
+      enqueueVideoSequence(resolved.uri).catch(() => undefined);
       const updatedWallpaper: Wallpaper = {
         ...wallpaper,
         videoUri: resolved.uri,
@@ -701,7 +753,7 @@ const WallpaperDetailModal = React.memo(function ({
           {/* Loading overlay */}
           {isApplying && (
             <View style={styles.loadingOverlay}>
-              <ActivityIndicator size="large" color="#22D3EE" />
+              <ActivityIndicator size="large" color={palette.accent} />
               <Text style={styles.loadingText}>Opening wallpaper picker...</Text>
             </View>
           )}
@@ -731,7 +783,15 @@ const WallpaperDetailModal = React.memo(function ({
               <Text style={styles.previewLabel}>IMAGE PREVIEW UNAVAILABLE</Text>
               <Text style={styles.videoErrorHint}>Try selecting another image</Text>
             </View>
-          ) : wallpaper.kind === 'video' && !videoError ? (
+          ) : wallpaper.kind === 'video' && sequenceInfo && !videoError ? (
+            <SequenceVideo
+              dir={sequenceInfo.dir}
+              frames={sequenceInfo.frames}
+              fps={sequenceInfo.fps}
+              loop={wallpaper.loop !== false}
+              style={[styles.videoPreviewAbs, previewRotationStyle]}
+            />
+          ) : wallpaper.kind === 'video' && isBundledVideo && !videoError ? (
             <View style={styles.videoPreviewWrap}>
               {/*
                 Ordering matters: react-native-video's TEXTURE view renders an
@@ -757,8 +817,16 @@ const WallpaperDetailModal = React.memo(function ({
                 viewType={ViewType.TEXTURE}
                 repeat={wallpaper.loop !== false}
                 muted={!wallpaper.audio}
-                playInBackground={true}
+                playInBackground={false}
                 playWhenInactive={false}
+                bufferConfig={{
+                  minBufferMs: 15000,
+                  maxBufferMs: 60000,
+                  bufferForPlaybackMs: 2500,
+                  bufferForPlaybackAfterRebufferMs: 5000,
+                  maxHeapAllocationPercent: 25,
+                  minBufferMemoryReservePercent: 10,
+                }}
                 onLoad={() => setVideoLoaded(true)}
                 onError={() => setVideoError(true)}
                 onEnd={() => {
@@ -842,6 +910,7 @@ const WallpaperDetailModal = React.memo(function ({
               </View>
               <Pressable
                 accessibilityRole="button"
+                accessibilityLabel="Play continuously toggle"
                 accessibilityState={{ checked: wallpaper.loop !== false }}
                 onPress={() =>
                   onWallpaperUpdated({ ...wallpaper, loop: wallpaper.loop === false })
@@ -851,8 +920,11 @@ const WallpaperDetailModal = React.memo(function ({
                   style={[
                     styles.checkbox,
                     wallpaper.loop !== false && styles.checkboxChecked,
-                  ]}
-                />
+                  ]}>
+                  {wallpaper.loop !== false && (
+                    <Text style={styles.checkmark}>✓</Text>
+                  )}
+                </View>
                 <Text style={styles.loopText}>
                   {wallpaper.loop === false ? 'Play once' : 'Play continuously'}
                 </Text>
@@ -989,6 +1061,7 @@ const WallpaperDetailModal = React.memo(function ({
 // ─── Animated Preview (doodle) ───────────────────────────────────────────
 
 function AnimatedPreview({ accent }: { accent: string }) {
+  const styles = useThemedStyles();
   const progress = React.useRef(new Animated.Value(0)).current;
 
   React.useEffect(() => {
@@ -1049,6 +1122,7 @@ function LiveThumb({
   style?: StyleProp<ViewStyle>;
   autoPlay?: boolean;
 }) {
+  const styles = useThemedStyles();
   const videoRef = React.useRef<VideoRef>(null);
   const [failed, setFailed] = React.useState(false);
   const source =
@@ -1088,6 +1162,15 @@ function LiveThumb({
       paused={!autoPlay}
       repeat
       playWhenInactive={false}
+      playInBackground={false}
+      bufferConfig={{
+        minBufferMs: 15000,
+        maxBufferMs: 60000,
+        bufferForPlaybackMs: 2500,
+        bufferForPlaybackAfterRebufferMs: 5000,
+        maxHeapAllocationPercent: 25,
+        minBufferMemoryReservePercent: 10,
+      }}
       onLoad={() => {
         if (!autoPlay) {
           try {
@@ -1115,6 +1198,7 @@ const WallpaperMedia = React.memo(function ({
   style?: StyleProp<ViewStyle>;
   autoPlay?: boolean;
 }) {
+  const styles = useThemedStyles();
   if (wallpaper.kind === 'static') {
     return (
       <Image
@@ -1171,6 +1255,92 @@ const WallpaperMedia = React.memo(function ({
   return <LiveThumb key={wallpaper.id} wallpaper={wallpaper} style={style} autoPlay={autoPlay} />;
 });
 
+/**
+ * Renders a user-imported video from its pre-extracted JPEG frame sequence
+ * (the same pixels the native wallpaper service plays). Drives a frame index at
+ * the recorded FPS with one JS timer while <Image> supplies frames, so the
+ * in-app preview matches the wallpaper without depending on the device's (often
+ * broken) hardware AVC decoder. Pauses automatically while the app is in the
+ * background.
+ */
+type SequenceVideoProps = {
+  dir: string;
+  frames: number;
+  fps: number;
+  loop?: boolean;
+  style?: StyleProp<ImageStyle>;
+};
+
+// How many frames ahead of the current one to keep warm in the preview's image
+// cache. Larger smooths decodes that lag under JS load, but each is a full JPEG.
+const LOOKAHEAD_PREVIEW_FRAMES = 3;
+
+function SequenceVideo({ dir, frames, fps, loop = true, style }: SequenceVideoProps) {
+  const [index, setIndex] = React.useState(0);
+  const [appActive, setAppActive] = React.useState(true);
+  const frameCount = Math.max(1, Math.trunc(frames));
+  const rate = Math.max(1, fps);
+
+  React.useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      setAppActive(state === 'active');
+    });
+    return () => subscription.remove();
+  }, []);
+
+  // Advance the timeline on the display's vsync (requestAnimationFrame) instead
+  // of a fixed setInterval, so the preview stays aligned with how the native
+  // wallpaper engine paces frames. Elapsed time is accumulated and converted to
+  // a frame index, so a dropped JS frame simply advances further rather than
+  // holding the previous picture.
+  React.useEffect(() => {
+    if (!appActive || frameCount <= 1) return undefined;
+    let rafId: number;
+    let last = Date.now();
+    let elapsed = 0;
+    const tick = () => {
+      const now = Date.now();
+      elapsed += now - last;
+      last = now;
+      const raw = Math.floor((elapsed / 1000) * rate);
+      const maxIndex = loop ? frameCount - 1 : frameCount - 1;
+      let next = raw % frameCount;
+      if (!loop && raw >= frameCount) next = maxIndex;
+      setIndex(current => (current === next ? current : next));
+      // Continue ticking for looping; for one-shot keep ticking so warmup never
+      // stalls, but clamp the index so it holds the final frame.
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [rate, frameCount, loop, appActive]);
+
+  const uriFor = React.useCallback(
+    (frameIndex: number) => {
+      const safe = ((frameIndex % frameCount) + frameCount) % frameCount;
+      return `file://${dir}/frame_${String(safe).padStart(6, '0')}.jpg`;
+    },
+    [dir, frameCount],
+  );
+
+  // Warm a small lookahead window so a slow decode under load never leaves the
+  // viewer on a stale frame.
+  React.useEffect(() => {
+    for (let ahead = 1; ahead <= LOOKAHEAD_PREVIEW_FRAMES; ahead += 1) {
+      Image.prefetch(uriFor(index + ahead)).catch(() => undefined);
+    }
+  }, [index, uriFor]);
+
+  return (
+    <Image
+      source={{ uri: uriFor(index) }}
+      resizeMode="cover"
+      resizeMethod="resize"
+      style={style}
+    />
+  );
+}
+
 // ─── Featured Billboard (auto-rotates every 5 seconds) ───────────────────
 
 const BILLBOARD_INTERVAL_MS = 5000;
@@ -1187,6 +1357,7 @@ type BillboardProps = {
 };
 
 const Billboard = React.memo(function ({ wallpapers, onSelect, scrollY, viewportHeight, active = true }: BillboardProps) {
+  const styles = useThemedStyles();
   const [index, setIndex] = React.useState(0);
   const fade = React.useRef(new Animated.Value(1)).current;
   const sectionTop = React.useRef(0);
@@ -1283,6 +1454,7 @@ const WallpaperCard = React.memo(function ({
   wallpaper: Wallpaper;
   onSelect: (wallpaper: Wallpaper) => void;
 }) {
+  const styles = useThemedStyles();
   return (
     <Pressable
       accessibilityRole="button"
@@ -1400,6 +1572,7 @@ const SectionTabs = React.memo(function ({
   dynamicCount: number;
   staticCount: number;
 }) {
+  const styles = useThemedStyles();
   return (
     <View style={styles.tabBar}>
       {SECTION_TABS.map(tab => {
@@ -1435,7 +1608,9 @@ const SectionTabs = React.memo(function ({
 
 // ─── Main App ────────────────────────────────────────────────────────────
 
-function App() {
+function AppShell() {
+  const styles = useThemedStyles();
+  const { isDark: isDarkTheme, palette } = useTheme();
   const [wallpapers, setWallpapers] = React.useState<Wallpaper[]>(bundledWallpapers);
   const [selectedWallpaper, setSelectedWallpaper] = React.useState<Wallpaper | null>(null);
   const [isCreating, setIsCreating] = React.useState(false);
@@ -1445,6 +1620,16 @@ function App() {
   const lastScrollCommit = React.useRef(0);
   const [capabilities, setCapabilities] = React.useState<WallpaperCapabilities | null>(null);
   const [pendingApplyId, setPendingApplyId] = React.useState<string | null>(null);
+  // Tracks whether the app is in the foreground so the billboard stops
+  // decoding videos and rotating while the user is elsewhere.
+  const [isForeground, setIsForeground] = React.useState(true);
+
+  React.useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => {
+      setIsForeground(state === 'active');
+    });
+    return () => subscription.remove();
+  }, [])
 
   React.useEffect(() => {
     startLogCapture();
@@ -1459,8 +1644,22 @@ function App() {
       .then(merged => {
         if (!cancelled) {
           setWallpapers(merged);
-          // Housekeeping on launch: trim orphaned media so storage stays
-          // bounded even across sessions where quota never got a chance.
+          // Housekeeping on launch: remove any stale DB rows for bundled
+          // wallpapers (older versions could persist them) so merely viewing
+          // defaults never creates extra library entries. Also de-duplicate
+          // accidental double-created wallpapers (same name + same media file)
+          // and trim orphaned media so storage stays bounded.
+          Promise.all([
+            wallpaperRepository.pruneBundledRows(),
+            wallpaperRepository.dedupeUserWallpapers(),
+          ])
+            .then(() => wallpaperRepository.getAll())
+            .then(cleaned => {
+              if (!cancelled && cleaned.length !== merged.length) {
+                setWallpapers(cleaned);
+              }
+            })
+            .catch(() => undefined);
           enforceStorageQuota(merged).catch(() => undefined);
         }
       })
@@ -1484,6 +1683,19 @@ function App() {
   const wallpapersRef = React.useRef(wallpapers);
   React.useEffect(() => {
     wallpapersRef.current = wallpapers;
+  }, [wallpapers]);
+
+  // Owns one media file per wallpaper (by URI). Updated synchronously on every
+  // create/update/delete so re-importing a video that is already in the library
+  // (or committing a fast double-tap) cannot add a second copy of the card.
+  const ownedMediaUrisRef = React.useRef(new Map<string, string>());
+  React.useEffect(() => {
+    const map = new Map<string, string>();
+    for (const item of wallpapers) {
+      const uri = item.kind === 'video' ? item.videoUri : item.imageUri;
+      if (uri) map.set(uri, item.id);
+    }
+    ownedMediaUrisRef.current = map;
   }, [wallpapers]);
 
   React.useEffect(() => {
@@ -1597,6 +1809,35 @@ function App() {
   }, []);
 
   const handleWallpaperCreated = React.useCallback((newWallpaper: Wallpaper) => {
+    // A user row whose title matches a bundled default (like a re-imported
+    // bundled video that keeps its name) would render as a second identical
+    // card, because the bundled catalog is always merged in by id. Open the
+    // existing bundled card instead of creating a phantom duplicate.
+    const bundledCollision = findBundledTitleCollision(
+      newWallpaper.title,
+      newWallpaper.kind,
+    );
+    if (bundledCollision) {
+      setIsCreating(false);
+      setSelectedWallpaper(bundledCollision);
+      showToast(`"${newWallpaper.title}" is already in your library`);
+      return;
+    }
+    const mediaUri =
+      newWallpaper.kind === 'video' ? newWallpaper.videoUri : newWallpaper.imageUri;
+    if (mediaUri) {
+      const ownerId = ownedMediaUrisRef.current.get(mediaUri);
+      if (ownerId) {
+        // A wallpaper using this exact media file already exists — never create
+        // a duplicate card for it. Open the existing one instead.
+        setIsCreating(false);
+        const existing = wallpapersRef.current.find(item => item.id === ownerId);
+        setSelectedWallpaper(existing ?? newWallpaper);
+        showToast(`"${newWallpaper.title}" is already in your library`);
+        return;
+      }
+      ownedMediaUrisRef.current.set(mediaUri, newWallpaper.id);
+    }
     wallpaperRepository.upsert(newWallpaper).catch(() => undefined);
     setWallpapers(current => [newWallpaper, ...current]);
     setSelectedWallpaper(newWallpaper);
@@ -1626,6 +1867,11 @@ function App() {
   }, []);
 
   const handleWallpaperUpdated = React.useCallback((updated: Wallpaper) => {
+    const previous = wallpapersRef.current.find(item => item.id === updated.id);
+    const oldMedia = previous ? (previous.kind === 'video' ? previous.videoUri : previous.imageUri) : undefined;
+    const newMedia = updated.kind === 'video' ? updated.videoUri : updated.imageUri;
+    if (oldMedia && oldMedia !== newMedia) ownedMediaUrisRef.current.delete(oldMedia);
+    if (newMedia) ownedMediaUrisRef.current.set(newMedia, updated.id);
     wallpaperRepository.upsert(updated).catch(() => undefined);
     setSelectedWallpaper(updated);
     // Re-reference the updated wallpaper so its video/thumbnail survive quota
@@ -1641,6 +1887,7 @@ function App() {
     // SQLite library and deregister the video digest.
     const mediaUri = deleted.videoUri ?? deleted.imageUri;
     if (mediaUri) {
+      ownedMediaUrisRef.current.delete(mediaUri);
       wallpaperBridge.deleteStoredMedia(mediaUri).catch(() => undefined);
       wallpaperRepository.videoFiles.findByUri(mediaUri).then(registered => {
         if (!registered) return;
@@ -1678,7 +1925,7 @@ function App() {
             onSelect={openDetail}
             scrollY={scrollY}
             viewportHeight={viewportHeight}
-            active={selectedWallpaper === null}
+            active={selectedWallpaper === null && isForeground}
           />
         );
       }
@@ -1698,12 +1945,12 @@ function App() {
         </View>
       );
     },
-    [section, liveItems, dynamicItems, staticItems, scrollY, viewportHeight, selectedWallpaper, openDetail],
+    [section, liveItems, dynamicItems, staticItems, scrollY, viewportHeight, selectedWallpaper, isForeground, styles, openDetail],
   );
 
   return (
     <ErrorBoundary>
-      <StatusBar barStyle="light-content" />
+      <StatusBar barStyle={isDarkTheme ? 'light-content' : 'dark-content'} />
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.wrapper}>
           <Pressable
@@ -1731,15 +1978,9 @@ function App() {
             ListHeaderComponent={
               <View style={styles.header}>
                 <View style={styles.brandRow}>
-                  <Image source={require('./assets/app-icon.png')} style={styles.brandIcon} />
-                  <View style={styles.brandText}>
-                    <Text testID="app-title" style={styles.title}>
-                      LiveWallpaper Studio
-                    </Text>
-                    <Text style={styles.subtitle}>
-                      Create, preview, and apply native Android live wallpapers.
-                    </Text>
-                  </View>
+                  <Text testID="app-title" style={styles.title}>
+                    LiveWallpaper Studio
+                  </Text>
                 </View>
                 <SectionTabs
                   section={section}
@@ -1751,7 +1992,7 @@ function App() {
                 <TextInput
                   accessibilityLabel="Search wallpapers"
                   placeholder="Search wallpapers..."
-                  placeholderTextColor="#64748B"
+                  placeholderTextColor={palette.placeholder}
                   value={searchQuery}
                   onChangeText={setSearchQuery}
                   style={styles.searchInput}
@@ -1814,6 +2055,14 @@ function App() {
         livePickerAvailable={capabilities?.liveWallpaperPickerAvailable ?? true}
       />
     </ErrorBoundary>
+  );
+}
+
+function App() {
+  return (
+    <ThemeProvider>
+      <AppShell />
+    </ThemeProvider>
   );
 }
 

@@ -2,19 +2,25 @@ package com.wall_e.bridge
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.util.LinkedHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Self-owned software playback of a pre-extracted JPEG frame sequence. The
  * wallpaper engine drives the timeline (display vsync), and this player just
- * answers "which frame looks right for this timestamp". Frames are decoded on
- * a dedicated background thread with a small moving lookahead so playback
- * (sequences are extracted at up to 30 fps) never hiccups on decode latency.
+ * answers "which frame looks right for this timestamp".
+ *
+ * Frames are decoded on a small parallel pool (a few threads, bounded) with a
+ * moving lookahead so playback (sequences are extracted at up to 30 fps) never
+ * hiccups on decode latency. The render thread never blocks on JPEG I/O: it
+ * only reads the LRU cache and the most recent decode results, so a slow disk
+ * or a momentarily busy core can never stall the wallpaper's vsync loop.
  *
  * Because it only touches JPEG files and keeps a small decoded cache, it works
  * on any device — including ones where the hardware/Media3 decoder cannot
@@ -26,7 +32,10 @@ class SequencePlayer(
     companion object {
         private const val TAG = "SequencePlayer"
         private const val MAX_CACHED_FRAMES = 20
-        private const val LOOKAHEAD_FRAMES = 10
+        private const val LOOKAHEAD_FRAMES = 8
+        // Small bounded pool. 3 workers move decode ahead fast without hogging
+        // the CPU (which would itself starve the render loop on low-end SoCs).
+        private const val DECODE_THREADS = 3
     }
 
     private val baseDir = File(dirPath)
@@ -35,7 +44,7 @@ class SequencePlayer(
     private val cache = object : LinkedHashMap<Int, Bitmap>(MAX_CACHED_FRAMES, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Bitmap>): Boolean {
             if (size > MAX_CACHED_FRAMES) {
-                // Eviction always happens on the loader thread, never the render
+                // Eviction always happens on a decode worker, never the render
                 // thread, so recycling here is safe.
                 eldest.value.recycle()
                 return true
@@ -44,12 +53,24 @@ class SequencePlayer(
         }
     }
 
-    /** Indices currently queued on the loader thread, so redundant decode
-     *  requests for the same frame collapse instead of piling up work. */
+    /** Indices currently queued or in-flight, so redundant decode requests for
+     *  the same frame collapse instead of piling up work. */
     private val pendingDecodes = HashSet<Int>()
 
-    private val loadThread = HandlerThread("seq-loader").apply { start() }
-    private val loadHandler = Handler(loadThread.looper)
+    private val decodePool: ExecutorService by lazy {
+        val threadId = AtomicInteger(0)
+        Executors.newFixedThreadPool(
+            DECODE_THREADS,
+            ThreadFactory { runnable ->
+                val t = Thread(runnable, "seq-decode-${threadId.incrementAndGet()}")
+                t.priority = Thread.NORM_PRIORITY
+                t.isDaemon = true
+                t
+            },
+        )
+    }
+
+    private val submissionLock = Any()
     private val lock = Any()
 
     private var frames = 0
@@ -58,6 +79,8 @@ class SequencePlayer(
     private var height = 0
     private var ready = false
     private var loadError: String? = null
+    @Volatile
+    private var released = false
 
     init {
         try {
@@ -96,9 +119,15 @@ class SequencePlayer(
      * the following frames so consecutive lookups hit cache.
      */
     fun frameAt(index: Int): Bitmap? {
-        if (!ready || frames == 0) return null
+        if (!ready || frames == 0 || released) return null
         val target = index.mod(frames)
         val found = synchronized(lock) { cache[target] }
+        // Frames further behind the cursor than a small lookback are now
+        // unreachable during forward playback; evict them so memory does not
+        // grow during long sessions.
+        synchronized(lock) {
+            evictBehindLocked(index)
+        }
         requestDecode(target)
         for (i in 1..LOOKAHEAD_FRAMES) {
             requestDecode((index + i).mod(frames))
@@ -106,27 +135,73 @@ class SequencePlayer(
         return found
     }
 
-    private fun requestDecode(index: Int) {
-        synchronized(lock) {
-            if (cache.containsKey(index) || pendingDecodes.contains(index)) return
-            pendingDecodes.add(index)
+    /** Drops decoded frames strictly behind [index] by more than the lookahead
+     *  window (allowing loop wrap). Caller must hold [lock]. */
+    private fun evictBehindLocked(index: Int) {
+        if (cache.isEmpty()) return
+        val it = cache.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (distanceBehind(index, entry.key) > LOOKAHEAD_FRAMES) {
+                try { entry.value.recycle() } catch (_: Throwable) {}
+                it.remove()
+            }
         }
-        loadHandler.post {
+    }
+
+    /** How far [frame] sits behind [current] with wrap-around handling. */
+    private fun distanceBehind(current: Int, frame: Int): Int {
+        val wrapped = ((frame - current) % frames + frames) % frames
+        return wrapped
+    }
+
+    private fun requestDecode(index: Int) {
+        if (released) return
+        val shouldSubmit = synchronized(submissionLock) {
+            val inCache = synchronized(lock) { cache.containsKey(index) }
+            if (inCache || pendingDecodes.contains(index)) {
+                false
+            } else {
+                pendingDecodes.add(index)
+                true
+            }
+        }
+        if (!shouldSubmit) return
+        decodePool.execute {
+            if (released) {
+                synchronized(submissionLock) { pendingDecodes.remove(index) }
+                return@execute
+            }
             val bitmap = decodeFrame(index)
             if (bitmap == null) {
-                synchronized(lock) { pendingDecodes.remove(index) }
-                return@post
+                synchronized(submissionLock) { pendingDecodes.remove(index) }
+                return@execute
             }
-            val alreadyDecoded = synchronized(lock) {
+            synchronized(submissionLock) {
+                // A release can tear down the cache while this frame was
+                // decoding. Never insert after release: re-inserting into the
+                // cleared cache would orphan a full decoded frame (and leak a
+                // few MB every wallpaper switch, which grows into persistent
+                // wallpaper stutter). Recycle instead so the memory returns
+                // immediately.
+                if (released) {
+                    pendingDecodes.remove(index)
+                    try { bitmap.recycle() } catch (_: Throwable) {}
+                    return@execute
+                }
+                val existed = synchronized(lock) {
+                    if (cache.containsKey(index)) {
+                        true
+                    } else {
+                        cache[index] = bitmap
+                        false
+                    }
+                }
                 pendingDecodes.remove(index)
-                if (cache.containsKey(index)) {
-                    true
-                } else {
-                    cache[index] = bitmap
-                    false
+                if (existed) {
+                    try { bitmap.recycle() } catch (_: Throwable) {}
                 }
             }
-            if (alreadyDecoded) bitmap.recycle()
         }
     }
 
@@ -139,17 +214,17 @@ class SequencePlayer(
      * catches up. Mirrors how real players drop frames under load.
      */
     fun latestReadyAtOrBefore(index: Int): Bitmap? {
-        if (!ready || frames == 0) return null
+        if (!ready || frames == 0 || released) return null
         val target = index.mod(frames)
+        // Cheap fast path: the exact frame may just have finished decoding.
         var bestDistance = -1
         var best: Bitmap? = null
-        synchronized(lock) {
-            for (key in cache.keys) {
-                val distance = ((target - key) % frames + frames) % frames
-                if (distance <= LOOKAHEAD_FRAMES && distance > bestDistance) {
-                    bestDistance = distance
-                    best = cache[key]
-                }
+        val cacheSnapshot = synchronized(lock) { HashMap(cache) }
+        for ((key, bmp) in cacheSnapshot) {
+            val distance = distanceBehind(target, key)
+            if (distance <= LOOKAHEAD_FRAMES && distance > bestDistance) {
+                bestDistance = distance
+                best = bmp
             }
         }
         return best
@@ -168,21 +243,29 @@ class SequencePlayer(
 
     /** Preloads the window around [startIndex] so the first paint is instant. */
     fun prime(startIndex: Int) {
-        if (!ready) return
+        if (!ready || released) return
         requestDecode(startIndex.mod(frames))
         for (i in 1..LOOKAHEAD_FRAMES) {
             requestDecode((startIndex + i).mod(frames))
         }
     }
 
-    /** Flushes decode-ahead and recycles everything (called from a non-render thread). */
+    /** Flushes decode-ahead and recycles everything. */
     fun release() {
-        synchronized(lock) {
+        if (released) return
+        released = true
+        synchronized(submissionLock) {
             pendingDecodes.clear()
-            cache.values.forEach { it.recycle() }
+        }
+        synchronized(lock) {
+            cache.values.forEach { bmp ->
+                try { bmp.recycle() } catch (_: Throwable) {}
+            }
             cache.clear()
         }
-        loadHandler.removeCallbacksAndMessages(null)
-        loadThread.quitSafely()
+        try {
+            decodePool.shutdownNow()
+        } catch (_: Throwable) {
+        }
     }
 }

@@ -81,18 +81,21 @@ class LiveWallpaperService : WallpaperService() {
         // polls the on-disk config while the engine is visible so the wallpaper
         // always converges to the newly-confirmed/committed configuration.
         private var configWatchdogRunning = false
+        private var configReloadRunning = false
         private val configWatchdog = object : Runnable {
             override fun run() {
                 if (!configWatchdogRunning) return
                 try {
-                    if (currentConfigSignature() != expectedConfigSignature()) {
+                    // Skip the disk read entirely while a reload is in progress so a
+                    // heavy player/sequence rebuild never overlaps with another one.
+                    if (!configReloadRunning && currentConfigSignature() != expectedConfigSignature()) {
                         Log.i(TAG, "CONFIG CHANGED ON DISK; reloading engine")
                         reloadConfigurationFromDisk()
                     }
                 } catch (error: Exception) {
                     Log.w(TAG, "Config watchdog check failed", error)
                 }
-                mainHandler.postDelayed(this, 1000L)
+                mainHandler.postDelayed(this, 600L)
             }
         }
 
@@ -409,6 +412,7 @@ class LiveWallpaperService : WallpaperService() {
                 if (configChanged) {
                     Log.i(TAG, "CONFIG CHANGED: kind $previousKind->$wallpaperKind, uri $previousUri->$configuredVideoUriString, loop $previousLoop->$shouldLoop, audio $previousAudio->$includeAudio, duration $previousDuration->$playbackDuration, rotation $previousRotation->$videoRotationDegrees")
                     releaseExoPlayer()
+                    releaseFrameFallback()
                     releaseStaticImage()
                     loadStaticImage()
                     startExoPlayer(surfaceHolder)
@@ -901,9 +905,13 @@ class LiveWallpaperService : WallpaperService() {
 
         private fun startSequencePlayback(): Boolean {
             if (sequenceDirPath.isBlank()) return false
-            // Tear down any stale ExoPlayer/GL pipeline from a previous video so
-            // the engine cannot keep rendering with a released/hung player while
-            // the sequence starts.
+            // Tear down any stale ExoPlayer/GL pipeline AND any previous software
+            // sequence player from an earlier wallpaper. A prior sequence player
+            // that is not released keeps its loader HandlerThread and decoded
+            // bitmap cache alive; switching wallpapers must release it or each
+            // change leaks a thread + several MB of bitmaps, which degrades into
+            // a cumulative stutter on the wallpaper home screen.
+            releaseFrameFallback()
             synchronized(playerLock) {
                 releaseExoPlayerLocked()
                 videoFailed = false
@@ -2070,39 +2078,46 @@ class LiveWallpaperService : WallpaperService() {
 
         /** Reload config from disk and rebuild player/renderers without a visibility change. */
         private fun reloadConfigurationFromDisk() {
-            val previousKind = wallpaperKind
-            val previousUri = configuredVideoUriString
-            val previousLoop = shouldLoop
-            val previousAudio = includeAudio
-            val previousDuration = playbackDuration
-            val previousRotation = videoRotationDegrees
-            val previousSeqDir = sequenceDirPath
+            if (configReloadRunning) return
+            configReloadRunning = true
+            try {
+                val previousKind = wallpaperKind
+                val previousUri = configuredVideoUriString
+                val previousLoop = shouldLoop
+                val previousAudio = includeAudio
+                val previousDuration = playbackDuration
+                val previousRotation = videoRotationDegrees
+                val previousSeqDir = sequenceDirPath
 
-            loadConfiguration()
-            loadStaticImage()
+                loadConfiguration()
+                loadStaticImage()
 
-            val configChanged =
-                previousKind != wallpaperKind ||
-                    previousUri != configuredVideoUriString ||
-                    previousLoop != shouldLoop ||
-                    previousAudio != includeAudio ||
-                    previousDuration != playbackDuration ||
-                    previousRotation != videoRotationDegrees ||
-                    previousSeqDir != sequenceDirPath
+                val configChanged =
+                    previousKind != wallpaperKind ||
+                        previousUri != configuredVideoUriString ||
+                        previousLoop != shouldLoop ||
+                        previousAudio != includeAudio ||
+                        previousDuration != playbackDuration ||
+                        previousRotation != videoRotationDegrees ||
+                        previousSeqDir != sequenceDirPath
 
-            if (!configChanged) return
+                if (!configChanged) return
 
-            Log.i(TAG, "WATCHDOG RELOAD: kind $previousKind->$wallpaperKind, uri $previousUri->$configuredVideoUriString, loop $previousLoop->$shouldLoop, audio $previousAudio->$includeAudio, duration $previousDuration->$playbackDuration, rotation $previousRotation->$videoRotationDegrees")
-            if (wallpaperKind == "battery") {
-                registerBatterySensors()
-            } else {
-                unregisterBatterySensors()
+                Log.i(TAG, "WATCHDOG RELOAD: kind $previousKind->$wallpaperKind, uri $previousUri->$configuredVideoUriString, loop $previousLoop->$shouldLoop, audio $previousAudio->$includeAudio, duration $previousDuration->$playbackDuration, rotation $previousRotation->$videoRotationDegrees")
+                if (wallpaperKind == "battery") {
+                    registerBatterySensors()
+                } else {
+                    unregisterBatterySensors()
+                }
+                releaseExoPlayer()
+                releaseFrameFallback()
+                releaseStaticImage()
+                loadStaticImage()
+                startExoPlayer(surfaceHolder)
+                refreshRendering()
+            } finally {
+                configReloadRunning = false
             }
-            releaseExoPlayer()
-            releaseStaticImage()
-            loadStaticImage()
-            startExoPlayer(surfaceHolder)
-            refreshRendering()
         }
 
         private fun loadStaticImage() {

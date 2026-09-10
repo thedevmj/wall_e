@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.os.BatteryManager
 import android.os.Build
 import java.net.HttpURLConnection
@@ -194,6 +195,9 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         private const val TAG = "WallpaperModule"
         private const val COMMITTED_PREFS = "wallpaper_pref"
         private const val PREVIEW_PREFS = "wallpaper_preview_pref"
+        private const val MAX_IMPORT_VIDEO_BYTES = 256L * 1024 * 1024
+
+        private class VideoTooLargeException(message: String) : IOException(message)
     }
 
     override fun getName(): String = "WallpaperModule"
@@ -686,7 +690,21 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     private fun copyStreamToAppStorage(input: InputStream, prefix: String, ext: String, label: String): Uri {
-        val file = File(File(reactContext.filesDir, "wallpapers").apply { mkdirs() }, "${prefix}_${System.currentTimeMillis()}.${ext.ifBlank { "mp4" }}")
+        val directory = File(reactContext.filesDir, "wallpapers").apply { mkdirs() }
+        val safeName = label.substringAfterLast('/').substringBefore('?')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(80)
+            .ifBlank { "asset" }
+        val base = "${prefix}_v${bundleVersionCode()}_$safeName"
+        val file = File(directory, base.substringBeforeLast('.') + ".${ext.ifBlank { "mp4" }}")
+        // A deterministic filename lets the software-playback frame-sequence cache
+        // hit across sessions: the same bundled video always lands on the same
+        // file path, so the extracted JPEG sequence is reused instead of being
+        // re-extracted (and re-copied) every time the wallpaper is opened.
+        if (file.isFile && file.length() > 0L) {
+            Log.i(TAG, "Reusing already prepared bundled media [$label] -> ${file.absolutePath} bytes=${file.length()}")
+            return Uri.fromFile(file)
+        }
         return try {
             input.use { source ->
                 file.outputStream().use { destination -> source.copyTo(destination) }
@@ -697,6 +715,14 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
         } catch (error: Exception) {
             file.delete()
             throw IOException("Unable to prepare bundled media [$label]", error)
+        }
+    }
+
+    private fun bundleVersionCode(): Int {
+        return try {
+            reactContext.packageManager.getPackageInfo(reactContext.packageName, 0).longVersionCode.toInt()
+        } catch (error: Exception) {
+            0
         }
     }
 
@@ -788,9 +814,58 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                 return
             }
 
+            resolvePendingWithRetry(pendingId, 0, promise)
+        } catch (error: Exception) {
+            Log.e(TAG, "resolvePendingApply failed", error)
+            postToUi {
+                promise.resolve(Arguments.createMap().apply { putBoolean("committed", false) })
+            }
+        }
+    }
+
+    /**
+     * Resolves a pending live wallpaper apply, re-checking `isOurLiveWallpaperActive`
+     * a few times before treating it as a cancel.
+     *
+     * When the user confirms in the picker and the app resumes, the system may
+     * not have fully registered our component as the active wallpaper for a few
+     * hundred milliseconds. Checking exactly once in that window would wrongly
+     * label a real confirmation a "cancel" and discard the selection, which
+     * showed up as "the new wallpaper was not applied" when switching between
+     * wallpapers quickly. A short bounded retry closes that race.
+     */
+    private fun resolvePendingWithRetry(pendingId: String, attempt: Int, promise: Promise) {
+        val resolved = resolvePendingStep(pendingId, promise)
+        if (resolved) return
+        if (attempt >= 4) {
+            Log.i(TAG, "resolvePendingApply: still inactive after retries, discarding pending $pendingId")
+            val preview = reactContext.getSharedPreferences(PREVIEW_PREFS, 0)
+            preview.edit().clear().commit()
+            clearPendingApply()
+            return
+        }
+        // Retry after a short delay so the system can register the new component.
+        val delay = (150L * (attempt + 1)).coerceAtMost(400L)
+        Log.i(TAG, "resolvePendingApply: inactive, retrying (attempt=${attempt + 1}/4) in ${delay}ms")
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (reactContext.hasActiveReactInstance()) {
+                resolvePendingWithRetry(pendingId, attempt + 1, promise)
+            } else {
+                // App is gone/torn down; abandon retries but keep the pending flag
+                // so a later resolve call can still commit it.
+                Log.w(TAG, "resolvePendingApply: react context dead, abandoning retry for $pendingId")
+            }
+        }, delay)
+    }
+
+    /**
+     * Attempts one resolution. Returns true when the result was already delivered
+     * (committed or cancelled); false when it should be retried.
+     */
+    private fun resolvePendingStep(pendingId: String, promise: Promise): Boolean {
+        return try {
             if (isOurLiveWallpaperActive()) {
                 Log.i(TAG, "resolvePendingApply: live wallpaper confirmed, committing $pendingId")
-                // Promote preview -> committed so the settled wallpaper persists.
                 commitPendingToWallpaper()
                 clearPendingApply()
                 postToUi {
@@ -800,23 +875,14 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
                     }
                     promise.resolve(result)
                 }
+                true
             } else {
-                Log.i(TAG, "resolvePendingApply: picker cancelled, discarding pending $pendingId")
-                // Discard the preview; the committed wallpaper stays unchanged.
-                preview.edit().clear().commit()
-                clearPendingApply()
-                postToUi {
-                    val result: WritableMap = Arguments.createMap().apply {
-                        putBoolean("committed", false)
-                    }
-                    promise.resolve(result)
-                }
+                Log.i(TAG, "resolvePendingApply: not active yet for $pendingId")
+                false
             }
         } catch (error: Exception) {
-            Log.e(TAG, "resolvePendingApply failed", error)
-            postToUi {
-                promise.resolve(Arguments.createMap().apply { putBoolean("committed", false) })
-            }
+            Log.w(TAG, "resolvePendingApply step failed; will retry", error)
+            false
         }
     }
 
@@ -922,6 +988,11 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
     }
 
     private fun copyVideoToAppStorage(uri: Uri): Uri {
+        // Refuse to import videos larger than the app can safely store and decode.
+        val knownSize = queryContentSize(uri)
+        if (knownSize != null && knownSize > MAX_IMPORT_VIDEO_BYTES) {
+            throw VideoTooLargeException(importedVideoTooLargeMessage(knownSize))
+        }
         val videoDirectory = File(reactContext.filesDir, "wallpapers").apply { mkdirs() }
         val videoFile = File(videoDirectory, "video_${System.currentTimeMillis()}.mp4")
         val input = reactContext.contentResolver.openInputStream(uri)
@@ -929,15 +1000,50 @@ class WallpaperModule(private val reactContext: ReactApplicationContext) : React
 
         try {
             input.use { source ->
-                videoFile.outputStream().use { destination -> source.copyTo(destination) }
+                videoFile.outputStream().use { destination ->
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val read = source.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > MAX_IMPORT_VIDEO_BYTES) {
+                            throw VideoTooLargeException(importedVideoTooLargeMessage(total))
+                        }
+                        destination.write(buffer, 0, read)
+                    }
+                }
             }
             Log.i(TAG, "Copied video details: exists=${videoFile.exists()} bytes=${videoFile.length()} readable=${videoFile.canRead()}")
             Log.i(TAG, "Copied selected video to app storage: ${videoFile.absolutePath}")
             return Uri.fromFile(videoFile)
         } catch (error: Exception) {
             videoFile.delete()
+            if (error is VideoTooLargeException) throw error
             throw IOException("Unable to copy the selected video into app storage", error)
         }
+    }
+
+    private fun queryContentSize(uri: Uri): Long? {
+        return try {
+            reactContext.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (index >= 0 && !cursor.isNull(index)) cursor.getLong(index) else null
+                    } else {
+                        null
+                    }
+                }
+        } catch (error: Exception) {
+            Log.w(TAG, "queryContentSize failed for $uri", error)
+            null
+        }
+    }
+
+    private fun importedVideoTooLargeMessage(bytes: Long): String {
+        val mb = (bytes / (1024 * 1024)).coerceAtLeast(1)
+        return "This video is $mb MB — videos larger than 256 MB cannot be imported."
     }
 
     private fun copyImageToAppStorage(uri: Uri): Uri {

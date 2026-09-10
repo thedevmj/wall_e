@@ -192,8 +192,12 @@ function CreateWallpaperModal({ visible, onClose, onCreated }: CreateModalProps)
       } else {
         setErrorMessage('No video was selected. Please try again.');
       }
-    } catch {
-      setErrorMessage('The selected video could not be read. Please choose another video.');
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : 'The selected video could not be read. Please choose another video.';
+      setErrorMessage(message);
     } finally {
       setIsPickingVideo(false);
     }
@@ -538,6 +542,15 @@ const WallpaperDetailModal = React.memo(function ({
       .then(uri => {
         if (!cancelled && uri) {
           setPreparedUri(uri);
+          // Pre-extract the software-playback frame sequence in the background so
+          // this bundled wallpaper plays smoothly on every device and the applied
+          // wallpaper uses the software path immediately (cached on disk, so this
+          // is cheap on every later open).
+          enqueueVideoSequence(uri)
+            .then(info => {
+              if (!cancelled && info) setSequenceInfo(info);
+            })
+            .catch(() => undefined);
         } else if (!cancelled) {
           setVideoError(true);
         }
@@ -927,6 +940,30 @@ const WallpaperDetailModal = React.memo(function ({
                 </View>
                 <Text style={styles.loopText}>
                   {wallpaper.loop === false ? 'Play once' : 'Play continuously'}
+                </Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="checkbox"
+                accessibilityLabel="Include audio toggle"
+                accessibilityState={{ checked: wallpaper.audio === true }}
+                onPress={() =>
+                  onWallpaperUpdated({
+                    ...wallpaper,
+                    audio: wallpaper.audio !== true,
+                  })
+                }
+                style={styles.loopRow}>
+                <View
+                  style={[
+                    styles.checkbox,
+                    wallpaper.audio === true && styles.checkboxChecked,
+                  ]}>
+                  {wallpaper.audio === true && (
+                    <Text style={styles.checkmark}>✓</Text>
+                  )}
+                </View>
+                <Text style={styles.loopText}>
+                  {wallpaper.audio === true ? 'Include audio' : 'No audio'}
                 </Text>
               </Pressable>
               {(!wallpaper.videoUri || videoError) && (

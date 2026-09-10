@@ -489,3 +489,59 @@ Verification: `tsc --noEmit` clean; `rtk lint` clean of errors (9 pre-existing i
 - `src/styles/index.ts`: removed the now-unused `brandIcon`, `brandText`, `subtitle`, `themeToggle`, `themeToggleText` style rules; `brandRow` now sets `justifyContent: 'center'` to keep the title centered. The `useTheme()` destructure in `AppShell` drops the now-unused `toggleTheme` (theme is still toggled programmatically; `isDarkTheme` is still used for `StatusBar` `barStyle`).
 
 Verification: `tsc --noEmit` clean (0 errors); `rtk lint` clean of errors (8 pre-existing inline-style warnings only); Jest PASS (1/1); `:app:compileDebugKotlin` BUILD SUCCESSFUL.
+
+---
+
+## SESSION MEMORY — stutter fixes, bundled smooth playback, import size limit, memory leak fix (this session)
+
+### What the user was experiencing
+- Wallpaper playback stutters, specifically on **bundled** wallpapers.
+- Applying a **second** wallpaper after the first still stutters persistently, even after waiting — user suspected memory management.
+
+### Deliverables / commands
+- Release APK (signed, 4 ABIs, ~212 MB): `wall_e\android\app\build\outputs\apk\release\app-release.apk`
+- Build: `& ".\gradlew.bat" assembleRelease` from `wall_e\android` (JDK 24 on PATH; keytool worked from JDK 17 path).
+- TypeScript check: `npx tsc --noEmit -p tsconfig.json`; lint script: `npm run lint` (rtk).
+
+### Release signing (IMPORTANT — do not lose)
+- Keystore: `wall_e\android\app\release-key.keystore` (PKCS12, RSA 2048, CN=WallE, validity 10000 days).
+- Password: `android123`, alias: `wall_e`. Keep private; needed for every future update so the same signature installs over old builds.
+- `android\app\build.gradle` `buildTypes.release` → `signingConfig signingConfigs.release`.
+
+### Changes in this session (all compiled, release APK rebuilt & verified)
+
+1. **Parallel software decode (stutter root cause #1)** — `bridge/SequencePlayer.kt`
+   - Old: one HandlerThread decoded frames serially (cache 14 / lookahead 6) → decode latency caused frame drops.
+   - New: bounded parallel pool `DECODE_THREADS = 3`, `MAX_CACHED_FRAMES = 20`, `LOOKAHEAD_FRAMES = 8`, `pendingDecodes: HashSet<Int>` dedupes in-flight requests, `evictBehindLocked()` prunes stale frames, `prime()` preloads the first window.
+
+2. **Reliable wallpaper apply (root cause for "not applied / slow switch")** — `bridge/WallpaperModule.kt`
+   - `resolvePendingApply` used to check `isOurLiveWallpaperActive()` exactly once; on resume the system may not yet register the component → a real confirmation was misread as a cancel.
+   - Rewrote as `resolvePendingWithRetry()` (up to 4 retries, 150–400 ms `postDelayed` backoff) + `resolvePendingStep()`. Confirmed wallpaper is now committed reliably.
+
+3. **Reduced apply-time watchdog churn** — `wallpaper/WallpaperService.kt`
+   - `configWatchdog` interval 400 → 600 ms; added `configReloadRunning` guard around `reloadConfigurationFromDisk()` so teardown/rebuild never overlaps.
+
+4. **Bundled wallpapers now smooth (stutter on bundled fixed)** — `WallpaperModule.kt` + `App.tsx`
+   - Root cause: bundled videos were re-copied to a new **timestamped** filename on every open, so the software frame-sequence cache never matched → always fell back to the stuttering ExoPlayer/GL path.
+   - `copyStreamToAppStorage()` now writes a deterministic filename `{prefix}_v{versionCode}_{cleanedName}.mp4` and **reuses the existing file** when present → the extracted sequence persists across sessions.
+   - `App.tsx` `prepareBundledMedia` effect now also calls `enqueueVideoSequence(uri)` after the local copy resolves and stores the result in `sequenceInfo`, so the bundled **in-app preview renders `SequenceVideo`** (smooth) and the applied wallpaper uses the software path immediately.
+
+5. **Imported video size limit** — `WallpaperModule.kt` + `App.tsx`
+   - `MAX_IMPORT_VIDEO_BYTES = 256 MB`. Enforced in `copyVideoToAppStorage()`: pre-check via `queryContentSize()` (OpenableColumns.SIZE) and count bytes during the streaming copy, aborting + deleting the partial file. Custom `VideoTooLargeException`.
+   - `App.tsx` `chooseVideo` catch now surfaces the native message (e.g. "This video is 900 MB — videos larger than 256 MB cannot be imported.").
+
+6. **Memory leak on wallpaper switch (stutter after applying 2nd wallpaper fixed)** — `SequencePlayer.kt`
+   - Root cause: `release()` cleared the cache, but decode-pool workers that were mid-flight re-inserted their freshly decoded bitmaps into the cleared cache afterwards → orphaned bitmaps leaked a few MB **every** wallpaper switch → accumulated → GC churn → persistent stutter.
+   - Fix: `released` is now `@Volatile`; after decoding, the worker re-checks `released` inside `submissionLock` and **recycles** the bitmap instead of inserting when released.
+   - This was the final bug matching "stutter after applying the second wallpaper even after waiting".
+
+### Known characteristics (report to user when asked)
+- First open of any new wallpaper still performs a one-time frame extraction in the background; playback switches to software once it completes (cached afterward).
+- Live-wallpaper picker preview staying open between switches is Android system behavior; the commit itself is what matters.
+
+### Editing conventions recalled
+- RN app root: `wall_e`; Android-only. Bundle assets via `require()` in `src/data/bundledWallpapers.ts` (video + poster pairs).
+- Software path constants: `FrameSequenceExtractor.MANIFEST_NAME`, `FRAME_PREFIX`; manifest fields `frames/fps/width/height/durationMs`.
+- Render decision order in `startExoPlayer()`: `startSequencePlayback()` first, then GL, then ExoPlayer, then `startFrameFallback()`.
+- Committed prefs = `wallpaper_pref`, preview prefs = `wallpaper_preview_pref`; keys `W_KIND/W_PATH/W_LOOP/W_DURATION/W_AUDIO/W_ACCENT/W_ROTATION/W_SEQ_DIR/W_SEQ_FPS/W_SEQ_FRAMES`, pending applied id `W_PREVIEW_ID`.
+- `commitPendingToWallpaper()` copies all including W_SEQ_* keys.

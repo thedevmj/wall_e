@@ -47,6 +47,11 @@ yarn-error.log
 *.webm
 *.mkv
 *.avi
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
 
 # fastlane
 #

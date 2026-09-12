@@ -3,66 +3,37 @@
  */
 
 import React from 'react';
-import ReactTestRenderer from 'react-test-renderer';
-import App from '../App';
+import { render, screen } from '@testing-library/react-native';
+import type { PropsWithChildren } from 'react';
 
-jest.mock('react-native-video', () => {
-  const mockReact = require('react');
-  const { View } = require('react-native');
-  const Video = mockReact.forwardRef(
-    (props: Record<string, unknown>, ref: unknown) =>
-      mockReact.createElement(View, { ...props, ref }),
-  );
-  Video.displayName = 'Video';
+// react-native-safe-area-context yields no native insets in the test env, so
+// its provider/view render their children as a plain View instead of null.
+jest.mock('react-native-safe-area-context', () => {
+  const actualReact = jest.requireActual<typeof import('react')>('react');
+  const { View } = jest.requireActual<typeof import('react-native')>('react-native');
+  const FakeSafeArea = ({
+    children,
+    ...props
+  }: PropsWithChildren<Record<string, unknown>>) => {
+    return actualReact.createElement(View, props, children);
+  };
   return {
-    __esModule: true,
-    default: Video,
-    ViewType: { TEXTURE: 0, SCHEDULE: 1, SURFACE: 2 },
+    SafeAreaProvider: FakeSafeArea,
+    SafeAreaView: FakeSafeArea,
+    useSafeAreaInsets: () => ({ top: 0, left: 0, right: 0, bottom: 0 }),
   };
 });
 
-test('renders wallpaper studio home screen', async () => {
-  jest.useFakeTimers();
-  let component: ReactTestRenderer.ReactTestRenderer;
+import App from '../App';
 
-  await ReactTestRenderer.act(async () => {
-    component = ReactTestRenderer.create(<App />);
-    // Flush the async SQLite repository load (getDB -> getAll promise chain)
-    // plus the capability probe so act has no pending microtasks left.
-    for (let i = 0; i < 10; i++) {
-      await Promise.resolve();
-    }
-  });
+test('renders wallpaper studio home screen with live and static categories', async () => {
+  await render(<App />);
 
-  const textNodes = component!.root.findAllByType(require('react-native').Text);
-  console.log(
-    textNodes.map(node => {
-      const text = Array.isArray(node.props.children)
-        ? node.props.children.join('')
-        : String(node.props.children ?? '');
-      return text;
-    }),
-  );
-  const hasTitle = textNodes.some(node => {
-    const text = Array.isArray(node.props.children)
-      ? node.props.children.join('')
-      : String(node.props.children ?? '');
-    return text.includes('LiveWallpaper Studio');
-  });
+  expect(screen.getByText('Live Wallpaper')).toBeTruthy();
+  expect(screen.getByText('All')).toBeTruthy();
+  expect(screen.getByText('Live')).toBeTruthy();
+  expect(screen.getByText('Static')).toBeTruthy();
+  expect(screen.getByPlaceholderText('Search wallpapers...')).toBeTruthy();
 
-  const hasLiveSection = textNodes.some(node => {
-    const text = Array.isArray(node.props.children)
-      ? node.props.children.join('')
-      : String(node.props.children ?? '');
-    return text.includes('Live wallpapers');
-  });
-
-  expect(hasTitle).toBe(true);
-  expect(hasLiveSection).toBe(true);
-  expect(textNodes.length).toBeGreaterThan(10);
-
-  await ReactTestRenderer.act(async () => {
-    component!.unmount();
-  });
-  jest.useRealTimers();
+  await expect(screen.findByText(/All \(\d+\)/)).resolves.toBeTruthy();
 });

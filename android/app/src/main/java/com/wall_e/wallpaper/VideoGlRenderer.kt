@@ -172,13 +172,18 @@ class VideoGlRenderer(
     }
 
     /**
-     * Posts the actual GL work to the dedicated render thread. When a fresh
-     * frame is pending we always queue (it must not be dropped); otherwise we
-     * coalesce so a flood of fade updates collapses to a single redraw.
+     * Posts the actual GL work to the dedicated render thread. At most one render
+     * is ever queued: renderGlFrame() consumes the *latest* SurfaceTexture image,
+     * so a second queued frame would only add backlog. Dropping the extra posts
+     * keeps the GL queue depth bounded (1 in-flight), which stops sustained
+     * decode-at-30fps sessions from accumulating queued frames until the GL
+     * thread falls further and further behind — the classic "smooth at first,
+     * stutters after a while" failure on low-end devices. Fade redraws coalesce
+     * the same way; renderGlFrame() reads the live fadeAlpha at draw time.
      */
     private fun postRender(newFrame: Boolean) {
         synchronized(renderQueuedLock) {
-            if (renderQueued && !newFrame) return
+            if (renderQueued) return
             renderQueued = true
         }
         glHandler.post {
@@ -412,9 +417,11 @@ class VideoGlRenderer(
         if (released) return
         released = true
         try {
-            // Run teardown on the GL thread so EGL destruction happens on the same
-            // thread that owns the context, then quit the thread.
-            val latch = java.util.concurrent.CountDownLatch(1)
+            // Post teardown to the GL thread and quit it. Do NOT block the
+            // calling thread with a CountDownLatch — the old GL context can
+            // coexist with a newly created one for a few frames; blocking the
+            // main thread for up to 2 seconds causes visible stutter during
+            // wallpaper switches.
             glHandler.post {
                 try {
                     val display = eglDisplay
@@ -440,9 +447,7 @@ class VideoGlRenderer(
                 } catch (e: Throwable) {
                     Log.e(TAG, "release error", e)
                 }
-                latch.countDown()
             }
-            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
         } finally {
             try {
                 glThread.quitSafely()

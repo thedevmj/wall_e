@@ -122,6 +122,11 @@ class LiveWallpaperService : WallpaperService() {
         private val fadeFadeMs = 700L
         private val fadeBlackHoldMs = 150L
         private val fadeTickIntervalMs = 50L
+        // Duration watcher poll interval. The optimization guide for 4GB devices
+        // calls for 1000–2000ms status updates, not 500ms: every poll crosses
+        // into ExoPlayer and contends on playerLock, so a faster cadence adds
+        // constant main-thread load for no visual benefit.
+        private val durationPollIntervalMs = 1000L
         private val fadeRunnable = object : Runnable {
             override fun run() {
                  synchronized(playerLock) {
@@ -175,6 +180,28 @@ class LiveWallpaperService : WallpaperService() {
         private var frameFallbackRunning = false
         private var staticBitmap: android.graphics.Bitmap? = null
         private var frameFallbackFailures = 0
+        // Reused ping-pong scratch buffers for the MediaMetadataRetriever
+        // fallback. Decoding at up to 30 fps used to allocate a fresh scaled
+        // bitmap every frame (~30 large allocations/sec = constant GC pressure,
+        // which showed up as wallpaper stutter after a few minutes). The decoder
+        // draws into one buffer while the render thread reads the other, and
+        // both are recycled only when the fallback is torn down.
+        private var fallbackScratch = arrayOfNulls<android.graphics.Bitmap>(2)
+        private var fallbackScratchCanvas: Canvas? = null
+        private var fallbackScratchCanvasBitmap: android.graphics.Bitmap? = null
+        private var fallbackScratchW = 0
+        private var fallbackScratchH = 0
+        private var fallbackScratchIndex = 0
+        // Last visually distinct frame painted by the canvas video path. The
+        // Choreographer loop ticks at the display refresh rate while software
+        // playback only produces new frames at the source fps (default 30), so
+        // without this check the wallpaper does a full-screen scaled blit ~60
+        // times/sec for ~30 new frames/sec. Skipping duplicate blits cuts the
+        // canvas path's CPU almost in half and leaves headroom for the UI, which
+        // is what keeps long sessions from degrading into stutter.
+        private var lastVideoCanvasIndex = -1
+        private var lastVideoCanvasBitmap: android.graphics.Bitmap? = null
+        private var lastVideoCanvasAlpha = -1f
         // Self-owned software playback: a pre-extracted JPEG frame sequence
         // (W_SEQ_DIR) written by the app's FrameSequenceExtractor. Used whenever
         // the device cannot create a video decoder for the wallpaper surface —
@@ -298,10 +325,10 @@ class LiveWallpaperService : WallpaperService() {
                     val bitmap = retriever.getFrameAtTime(positionUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     if (bitmap != null) {
                         synchronized(frameLock) {
-                            val previousBitmap = frameFallbackBitmap
                             frameFallbackBitmap = downscaleFallbackBitmap(bitmap)
-                            previousBitmap?.recycle()
-                            if (frameFallbackBitmap != bitmap) bitmap.recycle()
+                            // The ping-pong scratch buffers are reused and never
+                            // recycled here; only the freshly decoded frame returns.
+                            if (frameFallbackBitmap !== bitmap) bitmap.recycle()
                         }
                         frameFallbackFailures = 0
                     }
@@ -331,7 +358,7 @@ class LiveWallpaperService : WallpaperService() {
                     }
                 }
 
-                if (frameFallbackRunning && frameFallbackRetriever != null && (!frameFallbackFinished || frameFallbackBitmap != null)) {
+                if (frameFallbackRunning && frameFallbackRetriever != null && !frameFallbackFinished) {
                     frameDecoderHandler.postDelayed(this, frameFallbackIntervalMs)
                 }
             }
@@ -346,9 +373,7 @@ class LiveWallpaperService : WallpaperService() {
         override fun onDestroy() {
             stopConfigWatchdog()
             unregisterBatterySensors()
-            stopRendering()
-            releaseExoPlayer()
-            releaseFrameFallback()
+            releaseAllPlayback()
             frameDecoderThread.quitSafely()
             super.onDestroy()
         }
@@ -383,10 +408,7 @@ class LiveWallpaperService : WallpaperService() {
             super.onSurfaceDestroyed(holder)
             Log.i(TAG, "ON_SURFACE_DESTROYED")
             unregisterBatterySensors()
-            stopRendering()
-            releaseExoPlayer()
-            releaseFrameFallback()
-            releaseStaticImage()
+            releaseAllPlayback()
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
@@ -411,9 +433,8 @@ class LiveWallpaperService : WallpaperService() {
 
                 if (configChanged) {
                     Log.i(TAG, "CONFIG CHANGED: kind $previousKind->$wallpaperKind, uri $previousUri->$configuredVideoUriString, loop $previousLoop->$shouldLoop, audio $previousAudio->$includeAudio, duration $previousDuration->$playbackDuration, rotation $previousRotation->$videoRotationDegrees")
-                    releaseExoPlayer()
-                    releaseFrameFallback()
-                    releaseStaticImage()
+                    // Fully tear down old player before creating the new one.
+                    releaseAllPlayback()
                     loadStaticImage()
                     startExoPlayer(surfaceHolder)
                 } else {
@@ -680,8 +701,18 @@ class LiveWallpaperService : WallpaperService() {
         private fun scheduleEnforceDuration() {
             // (Re)arms the duration watcher. When a finished play-once clip is
             // restarted from onVisibilityChanged, this re-arms the watcher so the
-            // replayed clip is again cut to W_DURATION and held gracefully instead
-            // of playing to its natural END and getting stuck again.
+            // replayed clip is again held gracefully instead of playing past its
+            // natural END and getting stuck again.
+            // W_DURATION is the user-selected wallpaper window (1..30s, via the
+            // preview slider). Continuous loops just [0, window] and one-shot
+            // fades to black at the window end, but a clip shorter than the
+            // selection always plays in full.
+            //
+            // Loop mode defers to ExoPlayer's native REPEAT_MODE_ALL first (the
+            // guide's "use isLooping, don't seek-on-end" rule): the watcher only
+            // enforces a window that is SHORTER than the clip, and disarms itself
+            // once the media duration is known and fits within the window — so the
+            // common bundled-clip case runs a pure native loop with zero polling.
             val durationMs = playbackDuration * 1000L
             mainHandler.removeCallbacks(enforceDurationRunnable ?: Runnable {})
             enforceDurationRunnable = object : Runnable {
@@ -692,21 +723,38 @@ class LiveWallpaperService : WallpaperService() {
                         val player = exoPlayer
                         if (player == null) { working = false; return }
                         val pos = player.currentPosition
+                        val clipMs = if (player.duration > 0L) player.duration else 0L
                         if (shouldLoop) {
-                            if (pos < durationMs) {
-                                mainHandler.postDelayed(this, 500)
+                            // Duration unknown (not ready yet): re-check later.
+                            if (clipMs <= 0L) {
+                                mainHandler.postDelayed(this, durationPollIntervalMs)
+                                return
+                            }
+                            // The clip fits the window, so REPEAT_MODE_ALL already
+                            // loops it seamlessly. Nothing to enforce — stop the
+                            // timer so it does not poll the player forever.
+                            if (clipMs <= durationMs) {
+                                Log.i(TAG, "Clip fits window (${clipMs} <= $durationMs ms); using native looping, watcher disarmed")
+                                working = false
+                                return
+                            }
+                            val endMs = durationMs.coerceAtLeast(1L)
+                            if (pos < endMs) {
+                                mainHandler.postDelayed(this, durationPollIntervalMs)
                                 return
                             }
                             if (player.playbackState != Player.STATE_ENDED) {
                                 player.seekTo(0L)
                             }
-                            mainHandler.postDelayed(this, 500)
+                            mainHandler.postDelayed(this, durationPollIntervalMs)
                         } else {
-                            // One-shot: play the full clip, then fade to black when it
-                            // actually ends (its real duration / STATE_ENDED) — never cut
-                            // short at the W_DURATION preview window, or the fade would
-                            // happen mid-video instead of on the last frame.
-                            val endMs = if (player.duration > 0L) player.duration else durationMs
+                            // One-shot plays the selected window (or the whole clip
+                            // when it is shorter), then fades to black and holds.
+                            val endMs = when {
+                                clipMs > 0L -> minOf(durationMs, clipMs)
+                                durationMs > 0L -> durationMs
+                                else -> Long.MAX_VALUE
+                            }
                             val ended = player.playbackState == Player.STATE_ENDED || pos >= endMs
                             if (!oneShotEndSeen && ended) {
                                 beginFadeCycleLocked(player)
@@ -716,7 +764,7 @@ class LiveWallpaperService : WallpaperService() {
                     }
                 }
             }
-            mainHandler.postDelayed(enforceDurationRunnable!!, 500)
+            mainHandler.postDelayed(enforceDurationRunnable!!, durationPollIntervalMs)
         }
 
         /**
@@ -763,11 +811,7 @@ class LiveWallpaperService : WallpaperService() {
          */
         private fun restartVideoPipeline() {
             Log.i(TAG, "Restarting pipeline from visibility resume")
-            synchronized(playerLock) {
-                releaseExoPlayerLocked()
-            }
-            releaseFrameFallback()
-            releaseStaticImage()
+            releaseAllPlayback()
             loadStaticImage()
             startExoPlayer(surfaceHolder)
             refreshRendering()
@@ -797,6 +841,28 @@ class LiveWallpaperService : WallpaperService() {
             glEndedPending = false
             glEndedFrames = 0
             glReadyAt = 0L
+        }
+
+        /**
+         * Ensures all old playback resources (ExoPlayer, GL, sequence, frame
+         * fallback) are torn down before we create new ones. Without this,
+         * two SequencePlayers (old + new) briefly coexist during a wallpaper
+         * switch, doubling bitmap memory and decode-thread overhead.
+         */
+        private fun releaseAllPlayback() {
+            stopRendering()
+            cancelFade()
+            // Reset the duplicate-frame gate so the next wallpaper always paints
+            // its first frame even if its index/bitmap coincidentally matches the
+            // previous one.
+            lastVideoCanvasIndex = -1
+            lastVideoCanvasBitmap = null
+            lastVideoCanvasAlpha = -1f
+            synchronized(playerLock) {
+                releaseExoPlayerLocked()
+            }
+            releaseFrameFallback()
+            releaseStaticImage()
         }
 
         private fun switchGlToFallback() {
@@ -885,12 +951,18 @@ class LiveWallpaperService : WallpaperService() {
                     return
                 }
                 frameFallbackRetriever = retriever
-                frameFallbackDurationUs = durationMs * 1000L
+                // The wallpaper window is the user-selected duration (W_DURATION),
+                // capped at the real clip length so a short video always plays in
+                // full. Continuous loops [0, window]; one-shot fades at its end.
+                frameFallbackDurationUs = minOf(videoDurationMs, durationMs) * 1000L
                 frameFallbackStartedAt = System.currentTimeMillis()
                 frameFallbackFinished = false
                 frameFallbackRunning = true
                 videoErrorMessage = "Using compatibility frame playback"
-                Log.w(TAG, "Starting frame playback fallback: durationMs=$durationMs")
+                Log.w(
+                    TAG,
+                    "Starting frame playback fallback: selectedMs=$durationMs videoMs=$videoDurationMs",
+                )
                 frameDecoderHandler.post(decodeFallbackFrame)
             } catch (error: Exception) {
                 Log.e(TAG, "Frame playback fallback could not open video", error)
@@ -945,6 +1017,11 @@ class LiveWallpaperService : WallpaperService() {
         }
 
         private fun releaseFrameFallback() {
+            // SequencePlayer owns (and recycles) its own LRU cache. frameFallbackBitmap
+            // may currently point at one of those frames, so only recycle it when the
+            // MediaMetadataRetriever fallback owns it. Recycling the same Bitmap twice
+            // throws IllegalStateException on the service thread and can kill playback.
+            val sequenceOwnedFrame = sequencePlayer != null
             sequencePlayer?.let { player ->
                 try { player.release() } catch (_: Exception) {}
             }
@@ -952,8 +1029,21 @@ class LiveWallpaperService : WallpaperService() {
             frameDecoderHandler.removeCallbacks(decodeFallbackFrame)
             frameFallbackRunning = false
             synchronized(frameLock) {
-                frameFallbackBitmap?.recycle()
+                if (!sequenceOwnedFrame) {
+                    try { frameFallbackBitmap?.recycle() } catch (_: Throwable) {}
+                }
                 frameFallbackBitmap = null
+                // Release the reused fallback scratch buffers (guarded by the
+                // same lock the decoder writes them under).
+                for (i in fallbackScratch.indices) {
+                    try { fallbackScratch[i]?.recycle() } catch (_: Throwable) {}
+                    fallbackScratch[i] = null
+                }
+                fallbackScratchCanvas = null
+                fallbackScratchCanvasBitmap = null
+                fallbackScratchW = 0
+                fallbackScratchH = 0
+                fallbackScratchIndex = 0
             }
             try {
                 frameFallbackRetriever?.release()
@@ -967,12 +1057,69 @@ class LiveWallpaperService : WallpaperService() {
         }
 
         private fun downscaleFallbackBitmap(source: android.graphics.Bitmap): android.graphics.Bitmap {
-            val maxWidth = 480
-            if (source.width <= maxWidth) return source
-            val scale = maxWidth.toFloat() / source.width
-            val w = (source.width * scale).toInt()
-            val h = (source.height * scale).toInt()
-            return android.graphics.Bitmap.createScaledBitmap(source, w, h, true)
+            // Decoder frames are drawn into a reused ping-pong buffer pair (max
+            // ~1080px long edge) instead of allocating a fresh scaled bitmap every
+            // frame. The fallback decodes at up to 30 fps; reusing the buffers
+            // removes ~30 large bitmap allocations/second, which is what kept
+            // triggering GC pauses that grew into wallpaper stutter.
+            val maxWidth = 1080
+            val scale = minOf(1f, maxWidth.toFloat() / maxOf(source.width, source.height))
+            val w = (source.width * scale).toInt().coerceAtLeast(2)
+            val h = (source.height * scale).toInt().coerceAtLeast(2)
+            if (fallbackScratchW != w || fallbackScratchH != h) {
+                for (i in fallbackScratch.indices) {
+                    try { fallbackScratch[i]?.recycle() } catch (_: Throwable) {}
+                    fallbackScratch[i] =
+                        android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                }
+                fallbackScratchW = w
+                fallbackScratchH = h
+            }
+            // Ping-pong: write into the buffer opposite the one last handed to the
+            // render thread so a slow render read never races a concurrent decode.
+            fallbackScratchIndex = 1 - fallbackScratchIndex
+            val write = fallbackScratch[fallbackScratchIndex]!!
+            if (fallbackScratchCanvasBitmap !== write) {
+                fallbackScratchCanvas = Canvas(write)
+                fallbackScratchCanvasBitmap = write
+            }
+            fallbackScratchCanvas?.drawBitmap(
+                source,
+                android.graphics.Rect(0, 0, source.width, source.height),
+                android.graphics.Rect(0, 0, w, h),
+                videoPaint,
+            )
+            return write
+        }
+
+        private fun videoFallbackNeedsRedraw(): Boolean {
+            val seq = sequencePlayer
+            if (seq != null && seq.isReady()) {
+                // Sequence playback: redraw only when the source frame index
+                // advances (60Hz loop vs <=30fps source otherwise duplicates).
+                val fps = seq.frameRate().coerceAtLeast(1)
+                val index = ((System.currentTimeMillis() - frameFallbackStartedAt) * fps / 1000).toInt()
+                if (index != lastVideoCanvasIndex) {
+                    lastVideoCanvasIndex = index
+                    return true
+                }
+                return false
+            }
+            synchronized(frameLock) {
+                val current = frameFallbackBitmap
+                if (current == null) {
+                    // Nothing decoded yet — keep painting the loading/error frame.
+                    return true
+                }
+                // Retriever fallback: redraw on a fresh ping-pong buffer or when
+                // the one-shot black-fade alpha is still moving.
+                val alpha = if (!shouldLoop) oneShotFadeAlphaAt(System.currentTimeMillis()) else 0f
+                val alphaChanged = kotlin.math.abs(alpha - lastVideoCanvasAlpha) > 0.01f
+                if (current === lastVideoCanvasBitmap && !alphaChanged) return false
+                lastVideoCanvasBitmap = current
+                lastVideoCanvasAlpha = alpha
+                return true
+            }
         }
 
         private fun renderFrameFallback(canvas: Canvas): Boolean {
@@ -1171,7 +1318,13 @@ class LiveWallpaperService : WallpaperService() {
                             (videoFailed || videoRotationDegrees % 360 != 0 || frameFallbackBitmap != null || frameFallbackRetriever != null || sequencePlayer != null))
                 }
 
-                if (drawWithCanvas) {
+                // Skip the (expensive) full-screen canvas blit when nothing new
+                // was produced: software video playback produces frames at the
+                // source fps, not the display rate.
+                val shouldDraw =
+                    drawWithCanvas && (wallpaperKind != "video" || videoFallbackNeedsRedraw())
+
+                if (shouldDraw) {
                     var canvas: Canvas? = null
                     try {
                         canvas = holder.lockCanvas()
@@ -2109,9 +2262,10 @@ class LiveWallpaperService : WallpaperService() {
                 } else {
                     unregisterBatterySensors()
                 }
-                releaseExoPlayer()
-                releaseFrameFallback()
-                releaseStaticImage()
+                // Fully tear down the old player before creating the new one
+                // so no two SequencePlayers (or ExoPlayers) coexist and double
+                // the bitmap/thread memory.
+                releaseAllPlayback()
                 loadStaticImage()
                 startExoPlayer(surfaceHolder)
                 refreshRendering()

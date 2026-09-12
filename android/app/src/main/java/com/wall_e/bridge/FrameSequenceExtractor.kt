@@ -37,8 +37,14 @@ import java.io.File
 object FrameSequenceExtractor {
     private const val TAG = "FrameSequenceExtractor"
     private const val MAX_FPS = 30
-    private const val MAX_OUTPUT_DIMENSION = 960
-    private const val JPEG_QUALITY = 68
+    // 1080 long-edge keeps source wallpapers near their original crispness on
+    // the software fallback path. Each decoded ARGB_8888 frame stays under
+    // ~10 MB (SequencePlayer's 120 MB hard bitmap cap bounds the 8-frame LRU),
+    // and true 4K sources are still far more than any phone screen can show.
+    private const val MAX_OUTPUT_DIMENSION = 1080
+    // High JPEG quality keeps fine gradients (skies, smoke, shimmer) band-free
+    // on the fallback path; the quota manager already trims oversized sequences.
+    private const val JPEG_QUALITY = 85
     private const val TIMEOUT_USEC = 10_000L
     private const val MAX_SECONDS_EXTRACTED = 300L
 

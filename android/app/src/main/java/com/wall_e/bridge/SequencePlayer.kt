@@ -31,11 +31,22 @@ class SequencePlayer(
 ) {
     companion object {
         private const val TAG = "SequencePlayer"
-        private const val MAX_CACHED_FRAMES = 20
-        private const val LOOKAHEAD_FRAMES = 8
-        // Small bounded pool. 3 workers move decode ahead fast without hogging
-        // the CPU (which would itself starve the render loop on low-end SoCs).
-        private const val DECODE_THREADS = 3
+        // Tight budget: 8 decoded frames at 720×720 ARGB_8888 ≈ 15 MB. This
+        // keeps the total wallpaper-service RAM (old + new player during a
+        // switch) under 30 MB of bitmap memory, well within the 200 MB target.
+        private const val MAX_CACHED_FRAMES = 8
+        // Short lookahead: 4 frames is enough to smooth decode jitter at 30 fps
+        // without hoarding frames the render loop will not reach for a while.
+        private const val LOOKAHEAD_FRAMES = 4
+        // Two decode workers: enough to keep the pipeline fed on mid-range SoCs
+        // while leaving one CPU core free for the render/Choreographer loop on
+        // quad-core low-end devices.
+        private const val DECODE_THREADS = 2
+        // Hard memory cap for decoded bitmaps in this player instance. When the
+        // cache exceeds this, the least-recently-used frames are recycled even if
+        // they are within the lookahead window. Keeps total wallpaper-service
+        // RAM bounded during transitions (old + new player alive simultaneously).
+        private const val MAX_BITMAP_BYTES = 120L * 1024 * 1024 // 120 MB
     }
 
     private val baseDir = File(dirPath)
@@ -47,11 +58,16 @@ class SequencePlayer(
                 // Eviction always happens on a decode worker, never the render
                 // thread, so recycling here is safe.
                 eldest.value.recycle()
+                totalBitmapBytes -= eldest.value.byteCount
                 return true
             }
             return false
         }
     }
+
+    /** Running total of decoded bitmap bytes currently held in [cache]. */
+    @Volatile
+    private var totalBitmapBytes = 0L
 
     /** Indices currently queued or in-flight, so redundant decode requests for
      *  the same frame collapse instead of piling up work. */
@@ -143,9 +159,29 @@ class SequencePlayer(
         while (it.hasNext()) {
             val entry = it.next()
             if (distanceBehind(index, entry.key) > LOOKAHEAD_FRAMES) {
+                totalBitmapBytes -= entry.value.byteCount
                 try { entry.value.recycle() } catch (_: Throwable) {}
                 it.remove()
             }
+        }
+    }
+
+    /**
+     * Aggressively prunes the oldest entries (lowest frame indices) until the
+     * total bitmap memory is at or below [targetBytes]. Called when the memory
+     * budget is exceeded. Caller must hold [lock].
+     */
+    private fun pruneOldestLocked(targetBytes: Long) {
+        if (cache.isEmpty()) return
+        // Sort entries by frame index (oldest first) and recycle until under budget.
+        val sorted = cache.entries.sortedBy { it.key }
+        for (entry in sorted) {
+            if (totalBitmapBytes <= targetBytes) break
+            totalBitmapBytes -= entry.value.byteCount
+            try { entry.value.recycle() } catch (_: Throwable) {}
+            cache.remove(entry.key)
+            // Also drop from pending decodes so we do not re-decode frames we just evicted.
+            synchronized(submissionLock) { pendingDecodes.remove(entry.key) }
         }
     }
 
@@ -189,17 +225,23 @@ class SequencePlayer(
                     try { bitmap.recycle() } catch (_: Throwable) {}
                     return@execute
                 }
-                val existed = synchronized(lock) {
+                synchronized(lock) {
                     if (cache.containsKey(index)) {
-                        true
+                        pendingDecodes.remove(index)
+                        try { bitmap.recycle() } catch (_: Throwable) {}
                     } else {
                         cache[index] = bitmap
-                        false
+                        totalBitmapBytes += bitmap.byteCount
+                        pendingDecodes.remove(index)
+                        // Hard memory budget: when total decoded bitmap memory
+                        // exceeds the cap, aggressively prune the oldest entries
+                        // (lowest frame indices) so the wallpaper-service RAM
+                        // stays bounded even during transitions where two
+                        // SequencePlayer instances are briefly alive.
+                        if (totalBitmapBytes > MAX_BITMAP_BYTES) {
+                            pruneOldestLocked(MAX_BITMAP_BYTES / 2)
+                        }
                     }
-                }
-                pendingDecodes.remove(index)
-                if (existed) {
-                    try { bitmap.recycle() } catch (_: Throwable) {}
                 }
             }
         }
@@ -216,15 +258,15 @@ class SequencePlayer(
     fun latestReadyAtOrBefore(index: Int): Bitmap? {
         if (!ready || frames == 0 || released) return null
         val target = index.mod(frames)
-        // Cheap fast path: the exact frame may just have finished decoding.
         var bestDistance = -1
         var best: Bitmap? = null
-        val cacheSnapshot = synchronized(lock) { HashMap(cache) }
-        for ((key, bmp) in cacheSnapshot) {
-            val distance = distanceBehind(target, key)
-            if (distance <= LOOKAHEAD_FRAMES && distance > bestDistance) {
-                bestDistance = distance
-                best = bmp
+        synchronized(lock) {
+            for ((key, bmp) in cache) {
+                val distance = distanceBehind(target, key)
+                if (distance <= LOOKAHEAD_FRAMES && distance > bestDistance) {
+                    bestDistance = distance
+                    best = bmp
+                }
             }
         }
         return best
@@ -262,6 +304,7 @@ class SequencePlayer(
                 try { bmp.recycle() } catch (_: Throwable) {}
             }
             cache.clear()
+            totalBitmapBytes = 0L
         }
         try {
             decodePool.shutdownNow()

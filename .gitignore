@@ -41,6 +41,13 @@ node_modules/
 npm-debug.log
 yarn-error.log
 
+# Local wallpaper video assets
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
+
 # fastlane
 #
 # It is recommended to not store the screenshots in the git repo. Instead, use fastlane to re-generate the
